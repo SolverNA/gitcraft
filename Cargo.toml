@@ -1,0 +1,20 @@
+[package]
+name = "gitcraft"
+version = "0.1.0"
+edition = "2024"
+description = "Minecraft GitOps deployment and configuration manager"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }
+sha2 = "0.10"
+hex = "0.4"
+fs2 = "0.4"
+tempfile = "3"
+tiny_http = "0.12"
+rand = "0.8"

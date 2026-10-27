@@ -7,3 +7,6 @@ dist/
 *.jar
 secrets.env
 .env
+
+/target/
+.idea/
