@@ -14,7 +14,7 @@ pub fn load(path: &Path) -> Result<Value> {
 
 pub fn validate(mut value: Value) -> Result<Value> {
     let defaults = json!({
-        "repository":{"branch":"main","poll_interval_seconds":60},
+        "repository":{"branch":"main","poll_interval_seconds":60,"authoring_path":""},
         "deployment":{"service":"minecraft.service","empty_grace_seconds":60,"health_timeout_seconds":120},
         "rcon":{"host":"127.0.0.1","port":25575,"password_env":"MINECRAFT_RCON_PASSWORD","timeout_seconds":5},
         "web":{"host":"127.0.0.1","port":8765,"token_env":"GITCRAFT_WEB_TOKEN"},
@@ -103,6 +103,16 @@ pub fn validate(mut value: Value) -> Result<Value> {
         {
             bail!("Managed paths must be absolute non-root paths without ..");
         }
+        let mut prefix = PathBuf::new();
+        for part in path.components() {
+            prefix.push(part);
+            if prefix
+                .symlink_metadata()
+                .is_ok_and(|metadata| metadata.file_type().is_symlink())
+            {
+                bail!("Managed paths must not contain symlinks");
+            }
+        }
         let path = path.to_path_buf();
         if resolved
             .iter()
@@ -111,6 +121,44 @@ pub fn validate(mut value: Value) -> Result<Value> {
             bail!("Managed paths must be separate and non-nested");
         }
         resolved.push(path);
+    }
+    let authoring = value["repository"]["authoring_path"]
+        .as_str()
+        .context("repository.authoring_path must be a string")?;
+    if !authoring.is_empty() {
+        let path = Path::new(authoring);
+        if !path.is_absolute()
+            || path == Path::new("/")
+            || path
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            bail!("Authoring path must be an absolute non-root path without ..");
+        }
+        if [
+            "/etc", "/usr", "/bin", "/sbin", "/proc", "/sys", "/dev", "/run", "/boot",
+        ]
+        .iter()
+        .any(|root| path.starts_with(root))
+        {
+            bail!("Authoring path must not be in a protected system tree");
+        }
+        if resolved
+            .iter()
+            .any(|other| path.starts_with(other) || other.starts_with(path))
+        {
+            bail!("Authoring clone must be separate from every managed path");
+        }
+        let mut prefix = PathBuf::new();
+        for part in path.components() {
+            prefix.push(part);
+            if prefix
+                .symlink_metadata()
+                .is_ok_and(|metadata| metadata.file_type().is_symlink())
+            {
+                bail!("Authoring path must not contain symlinks");
+            }
+        }
     }
     for (section, key, min, max) in [
         ("repository", "poll_interval_seconds", 1, 86400),
@@ -218,5 +266,33 @@ mod tests {
             0o600
         );
         assert!(load(&file).is_ok());
+    }
+    #[test]
+    fn authoring_must_be_separate_and_without_symlinks() {
+        let mut value = sample();
+        value["repository"]["authoring_path"] = json!("/tmp/gc/server/editor");
+        assert!(validate(value).is_err());
+        let mut value = sample();
+        value["repository"]["authoring_path"] = json!("/etc/gitcraft/editor");
+        assert!(validate(value).is_err());
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("real");
+        fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, root.path().join("alias")).unwrap();
+        let mut value = sample();
+        value["repository"]["authoring_path"] = json!(root.path().join("alias/clone"));
+        assert!(validate(value).is_err());
+    }
+    #[test]
+    fn managed_symlink_cannot_alias_the_authoring_clone() {
+        let root = tempfile::tempdir().unwrap();
+        let authoring = root.path().join("authoring");
+        fs::create_dir(&authoring).unwrap();
+        let alias = root.path().join("live-alias");
+        std::os::unix::fs::symlink(&authoring, &alias).unwrap();
+        let mut value = sample();
+        value["repository"]["authoring_path"] = json!(authoring);
+        value["paths"]["server"] = json!(alias);
+        assert!(validate(value).is_err());
     }
 }

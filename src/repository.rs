@@ -6,7 +6,7 @@ use std::{
     collections::BTreeSet,
     fs::{self, OpenOptions},
     io::Write,
-    path::Path,
+    path::{Path, PathBuf},
     process::Command,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -58,6 +58,52 @@ fn command(repo: &Path, program: &str, args: &[&str]) -> Result<String> {
         "Command output exceeds safe limit"
     );
     Ok(String::from_utf8(output.stdout)?)
+}
+fn github_name(url: &str) -> Result<String> {
+    let value = url
+        .trim()
+        .strip_prefix("git@github.com:")
+        .or_else(|| url.trim().strip_prefix("https://github.com/"))
+        .context("Authoring origin must use GitHub SSH or credential-free HTTPS")?;
+    let value = value.strip_suffix(".git").unwrap_or(value);
+    let parts: Vec<_> = value.split('/').collect();
+    ensure!(
+        parts.len() == 2
+            && parts.iter().all(|part| !part.is_empty()
+                && part
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))),
+        "Invalid GitHub repository identity"
+    );
+    Ok(value.to_ascii_lowercase())
+}
+/// The Web editor receives only a preconfigured, separate clone bound to the deployment origin.
+pub fn authoring_repository(config: &Value) -> Result<PathBuf> {
+    let config = crate::config::validate(config.clone())?;
+    let path = config["repository"]["authoring_path"]
+        .as_str()
+        .context("Authoring clone configuration missing")?;
+    ensure!(
+        !path.is_empty(),
+        "Configure repository.authoring_path before using the editor"
+    );
+    let path = PathBuf::from(path);
+    ensure!(
+        path.join(".git").is_dir() && !path.join(".git").is_symlink(),
+        "Authoring requires a normal Git clone without a symlink control directory"
+    );
+    let origin = command(&path, "git", &["config", "--get", "remote.origin.url"])?;
+    ensure!(
+        github_name(&origin)?
+            == github_name(
+                config["repository"]["url"]
+                    .as_str()
+                    .context("Deployment URL missing")?
+            )?,
+        "Authoring origin differs from configured deployment repository"
+    );
+    crate::policy::validate_repository(&path)?;
+    Ok(path)
 }
 pub fn propose(repo: &Path, base: &str, title: &str) -> Result<Value> {
     ensure!(
@@ -167,7 +213,11 @@ pub fn propose(repo: &Path, base: &str, title: &str) -> Result<Value> {
     command(
         repo,
         "git",
-        &["push", "origin", &format!("HEAD:refs/heads/{branch}")],
+        &[
+            "push",
+            "origin",
+            &format!("{}:refs/heads/{branch}", commit.trim()),
+        ],
     )?;
     let mut body = tempfile::NamedTempFile::new()?;
     writeln!(
@@ -212,5 +262,48 @@ mod tests {
         fs::create_dir(temp.path().join(".git")).unwrap();
         fs::write(temp.path().join("README.md"), "safe").unwrap();
         assert!(propose(temp.path(), "main", "\nunsafe").is_err());
+    }
+    #[test]
+    fn authoring_origin_is_bound_and_control_directory_cannot_be_a_symlink() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("editor");
+        fs::create_dir(&repo).unwrap();
+        command(&repo, "git", &["init", "--quiet"]).unwrap();
+        command(
+            &repo,
+            "git",
+            &["remote", "add", "origin", "git@github.com:other/config.git"],
+        )
+        .unwrap();
+        let paths: serde_json::Map<_, _> = [
+            "repository",
+            "server",
+            "state",
+            "cache",
+            "staging",
+            "backups",
+        ]
+        .into_iter()
+        .map(|key| (key.into(), json!(root.path().join(key))))
+        .collect();
+        let config = json!({"repository":{"url":"https://github.com/team/config.git","authoring_path":repo},"paths":paths});
+        assert!(authoring_repository(&config).is_err());
+        command(
+            &repo,
+            "git",
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "git@github.com:team/config.git",
+            ],
+        )
+        .unwrap();
+        assert!(authoring_repository(&config).is_ok());
+        let actual = root.path().join("git-control");
+        fs::rename(repo.join(".git"), &actual).unwrap();
+        std::os::unix::fs::symlink(actual, repo.join(".git")).unwrap();
+        assert!(authoring_repository(&config).is_err());
+        assert!(propose(&repo, "main", "Unsafe control").is_err());
     }
 }

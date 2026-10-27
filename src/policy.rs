@@ -275,6 +275,29 @@ fn known_config(path: &str) -> bool {
             | "server-settings/pufferfish.yml"
     )
 }
+/// Existing approved text configs only. Metadata/workflow edits use a separate reviewed process.
+pub fn editable_paths(repo: &Path) -> Result<Vec<String>> {
+    validate_repository(repo)?;
+    let mut approved = BTreeSet::new();
+    let path = repo.join("export-policy.json");
+    if path.exists() {
+        let value: Value = serde_json::from_slice(&fs::read(path)?)?;
+        for path in value["approved_config_paths"]
+            .as_array()
+            .context("Missing config approvals")?
+        {
+            approved.insert(path.as_str().context("Invalid approval")?.to_owned());
+        }
+    }
+    Ok(tracked_files(repo)?
+        .into_iter()
+        .filter(|path| {
+            config_path(path).is_ok()
+                && (known_config(path) || approved.contains(path))
+                && repo.join(path).is_file()
+        })
+        .collect())
+}
 fn collect(base: &Path, current: &Path, output: &mut BTreeSet<String>) -> Result<()> {
     if !current.exists() {
         return Ok(());
