@@ -1,5 +1,5 @@
 //! Loopback UI. Session cookies, CSRF tokens and no arbitrary paths or shell commands.
-use crate::{config, deploy};
+use crate::{config, deploy, transfer};
 use anyhow::{Context, Result, bail};
 use rand::{RngCore, rngs::OsRng};
 use serde_json::{Value, json};
@@ -56,7 +56,7 @@ fn respond(request: Request, code: u16, body: String, cookie: Option<String>) {
         ("X-Content-Type-Options", "nosniff"),
         (
             "Content-Security-Policy",
-            "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'",
+            "default-src 'none'; style-src 'unsafe-inline'; script-src 'self'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'",
         ),
     ] {
         response.add_header(Header::from_bytes(name, value).unwrap());
@@ -100,6 +100,111 @@ fn fields(body: &str) -> Result<HashMap<String, String>> {
         .collect()
 }
 
+fn json_response(request: Request, code: u16, value: Value) {
+    let mut response = Response::from_string(value.to_string()).with_status_code(code);
+    for (k, v) in [
+        ("Content-Type", "application/json"),
+        ("Cache-Control", "no-store"),
+        ("X-Content-Type-Options", "nosniff"),
+    ] {
+        response.add_header(Header::from_bytes(k, v).unwrap());
+    }
+    let _ = request.respond(response);
+}
+fn read_json(request: &mut Request, max: usize) -> Result<Value> {
+    anyhow::ensure!(
+        request.body_length().is_some_and(|n| n <= max),
+        "request body exceeds size limit"
+    );
+    let mut bytes = Vec::new();
+    request
+        .as_reader()
+        .take(max as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    anyhow::ensure!(bytes.len() <= max, "request body exceeds size limit");
+    Ok(serde_json::from_slice(&bytes)?)
+}
+fn transfer_api(mut request: Request, path: &Path, admin: &str, session_csrf: Option<&str>) {
+    let result = (|| -> Result<Value> {
+        let config = config::load(path)?;
+        let route = request.url().to_owned();
+        let method = request.method().as_str().to_owned();
+        if let Some(origin) = header(&request, "Origin") {
+            anyhow::ensure!(
+                Some(origin) == header(&request, "Host").map(|h| format!("http://{h}")),
+                "forbidden request origin"
+            );
+        }
+        let bearer = header(&request, "Authorization")
+            .and_then(|s| s.strip_prefix("Bearer ").map(str::to_owned))
+            .unwrap_or_default();
+        if route == "/api/transfers" && method == "POST" {
+            let csrf = header(&request, "X-CSRF-Token");
+            anyhow::ensure!(
+                equal(admin, &bearer)
+                    || session_csrf
+                        .zip(csrf.as_deref())
+                        .is_some_and(|(a, b)| equal(a, b)),
+                "authentication required"
+            );
+            let manifest = serde_json::from_value(read_json(&mut request, 16 * 1024 * 1024)?)?;
+            return transfer::create(&config, manifest);
+        }
+        let pieces: Vec<_> = route.trim_start_matches('/').split('/').collect();
+        anyhow::ensure!(
+            pieces.len() >= 3 && pieces[0] == "api" && pieces[1] == "transfers",
+            "unknown transfer route"
+        );
+        let id = pieces[2];
+        anyhow::ensure!(!bearer.is_empty(), "scoped transfer token required");
+        if method == "GET" && pieces.len() == 3 {
+            return transfer::status(&config, id, &bearer);
+        }
+        if method == "PUT" && pieces.len() == 6 && pieces[3] == "files" {
+            let index = pieces[4].parse()?;
+            let offset = pieces[5].parse()?;
+            let digest =
+                header(&request, "X-Chunk-SHA256").context("chunk SHA-256 header missing")?;
+            // Authenticate before reading a potentially large request body.
+            transfer::status(&config, id, &bearer)?;
+            anyhow::ensure!(
+                request
+                    .body_length()
+                    .is_some_and(|n| n <= transfer::CHUNK_BYTES),
+                "chunk exceeds byte limit"
+            );
+            let mut bytes = Vec::new();
+            request
+                .as_reader()
+                .take(transfer::CHUNK_BYTES as u64 + 1)
+                .read_to_end(&mut bytes)?;
+            return transfer::chunk(&config, id, &bearer, index, offset, &digest, &bytes);
+        }
+        if method == "POST" && pieces.len() == 4 {
+            let body = read_json(&mut request, 1024)?;
+            return match pieces[3] {
+                "verify" => transfer::verify(&config, id, &bearer),
+                "commit" => {
+                    transfer::commit(&config, id, &bearer, body["confirm_world_replace"] == true)
+                }
+                "recover" => transfer::recover(&config, id, &bearer),
+                _ => bail!("unknown transfer operation"),
+            };
+        }
+        bail!("unknown transfer route")
+    })();
+    match result {
+        Ok(value) => json_response(request, 200, value),
+        Err(error) => json_response(request, 400, json!({"error":error.to_string()})),
+    }
+}
+
+fn transfer_page(csrf: &str) -> String {
+    format!(
+        "<h2>Прямой перенос local → VPS</h2><p>Данные идут прямо на этот сервер через SSH-туннель. Миры и JAR не попадают в Git или стороннее хранилище.</p><p>Браузер: максимум 64 MiB на файл, размер проверяется до чтения. Для больших файлов: <code>gitcraft transfer plan --source PATH --kind world --source-consistency stopped --output plan.json</code>, затем <code>gitcraft transfer send --endpoint http://127.0.0.1:8765 --plan plan.json --session session.json</code>. Для JAR укажите kind engine/plugin/mod.</p><input id=csrf type=hidden value='{csrf}'><label>Тип <select id=kind><option value=world>Мир (папка)</option><option value=engine>Ядро</option><option value=plugin>Плагины</option><option value=mod>Моды</option></select></label><p><input id=files type=file multiple><input id=folder type=file webkitdirectory multiple></p><label><input id=consistent type=checkbox>Локальный Minecraft остановлен или выбрана заранее сделанная согласованная snapshot-копия</label><p><select id=consistency><option value=stopped>Источник остановлен</option><option value=snapshot>Готовый snapshot</option></select></p><button id=send>Передать / продолжить</button><button id=verify>Проверить целые файлы</button><p><label><input id=confirm type=checkbox>Подтверждаю замену выбранных миров на VPS с резервной копией. Minecraft на VPS остановлен.</label></p><button id=commit>Применить проверенный перенос</button><button id=status>Статус</button><button id=recover>Восстановить прерванную замену (сервер остановлен)</button><progress id=progress max=100 value=0></progress><pre id=output>Выберите файлы/папку. При возобновлении выберите тот же источник.</pre><p>Session token хранится только в localStorage этого браузера; не передавайте его другим. После рестарта сервер сохранит смещения. Окончательное применение никогда не запускает Minecraft автоматически.</p><a href='/'>Панель</a><script src='/assets/transfer.js'></script>"
+    )
+}
+
 pub fn serve(path: &Path) -> Result<()> {
     let value = config::load(path)?;
     let env = value["web"]["token_env"]
@@ -137,6 +242,32 @@ pub fn serve(path: &Path) -> Result<()> {
             .map(|(csrf, _)| csrf.clone());
         let method = request.method().as_str().to_owned();
         let url = request.url().to_owned();
+        if url.starts_with("/api/transfers") {
+            transfer_api(request, path, &token, csrf.as_deref());
+            continue;
+        }
+        if method == "GET" && url == "/assets/transfer.js" {
+            let mut response = Response::from_string(include_str!("transfer.js"));
+            response.add_header(
+                Header::from_bytes("Content-Type", "text/javascript; charset=utf-8").unwrap(),
+            );
+            response.add_header(Header::from_bytes("Cache-Control", "no-store").unwrap());
+            let _ = request.respond(response);
+            continue;
+        }
+        if method == "GET" && url == "/transfer" {
+            if let Some(csrf) = csrf {
+                respond(request, 200, transfer_page(&csrf), None);
+            } else {
+                respond(
+                    request,
+                    403,
+                    "Войдите через <a href='/'>панель</a>.".into(),
+                    None,
+                );
+            }
+            continue;
+        }
         if method == "GET" && url == "/" {
             if let Some(csrf) = csrf {
                 let current = config::load(path)?;
@@ -146,7 +277,7 @@ pub fn serve(path: &Path) -> Result<()> {
                     request,
                     200,
                     format!(
-                        "<h2>Состояние</h2><pre>{}</pre><form method=post action=/deploy>{hidden}<button>Проверить и применить, когда сервер пуст</button></form><h2>Локальные настройки</h2><p>Можно менять вручную в agent.yml. Конфиги Minecraft меняются через PR.</p><form method=post action=/settings>{hidden}<textarea name=settings>{}</textarea><button>Сохранить</button></form><form method=post action=/logout>{hidden}<button>Выйти</button></form>",
+                        "<p><a href=/transfer>Перенести миры и JAR напрямую</a> · <a href=/onboarding>Репозиторий / экспорт / adopt</a></p><h2>Состояние</h2><pre>{}</pre><form method=post action=/deploy>{hidden}<button>Проверить и применить, когда сервер пуст</button></form><h2>Локальные настройки</h2><p>Можно менять вручную в agent.yml. Конфиги Minecraft меняются через PR.</p><form method=post action=/settings>{hidden}<textarea name=settings>{}</textarea><button>Сохранить</button></form><form method=post action=/logout>{hidden}<button>Выйти</button></form>",
                         escape(&serde_json::to_string_pretty(&status(&current))?),
                         escape(&serde_json::to_string_pretty(&editable)?)
                     ),
