@@ -217,7 +217,7 @@ fn transfer_page(csrf: &str) -> String {
 fn onboarding_page(csrf: &str, current: &Value) -> String {
     let hidden = format!("<input type=hidden name=csrf value='{csrf}'>");
     format!(
-        "<h2>Подключение и проверка перед изменением</h2><p>Настройки подключения сначала сохраняются как план. Git-конфиги редактируются в отдельном рабочем клоне и отправляются через PR; bare-кэш агента для этого не подходит. GitHub write credentials нужны только локальному gh пользователя, серверу деплоя достаточно read-only ключа.</p><h3>Репозиторий / ветка</h3><form method=post action=/onboarding-plan>{hidden}<input name=url required value='{}'><input name=branch required value='{}'><button>Показать план</button></form><h3>Экспорт настроек из доступной этому процессу папки</h3><p>Для локального Minecraft запустите эту панель локально или используйте gitcraft export plan/apply. Браузер не открывает произвольные пути на другой машине.</p><form method=post action=/export-plan>{hidden}<input name=server required placeholder='/path/to/stopped-local-server'><textarea name=include placeholder='Явно выбранные относительные пути, по одному на строку'></textarea><input name=metadata placeholder='/path/to/artifacts-metadata.json'><button>Сканировать и показать план</button></form><h3>Предложить проверенные правки через PR</h3><form method=post action=/propose>{hidden}<input name=repository required placeholder='/path/to/separate-working-clone'><input name=base value=main required><input name=title value='Minecraft configuration update' required><label><input type=checkbox name=reviewed value=yes required>Я проверил локальные изменения</label><button>Создать ветку и PR</button></form><h3>Подключить существующий сервер без перезаписи unit/Java/RCON</h3><form method=post action=/adopt-plan>{hidden}<input name=server required value='{}'><button>Показать adopt-план</button></form><a href='/'>Панель</a>",
+        "<h2>Подключение и проверка перед изменением</h2><p>Настройки подключения сначала сохраняются как план. Git-конфиги редактируются в отдельном рабочем клоне и отправляются через PR; bare-кэш агента для этого не подходит. GitHub write credentials нужны только локальному gh пользователя, серверу деплоя достаточно read-only ключа.</p><h3>Репозиторий / ветка</h3><form method=post action=/onboarding-plan>{hidden}<input name=url required value='{}'><input name=branch required value='{}'><button>Показать план</button></form><h3>Экспорт настроек из доступной этому процессу папки</h3><p>Для локального Minecraft запустите эту панель локально или используйте gitcraft export plan/apply. Браузер не открывает произвольные пути на другой машине.</p><form method=post action=/export-plan>{hidden}<input name=server required placeholder='/path/to/stopped-local-server'><textarea name=include placeholder='Явно выбранные относительные пути, по одному на строку'></textarea><input name=metadata placeholder='/path/to/artifacts-metadata.json'><button>Сканировать и показать план</button></form><p><a href=/editor>Просмотреть diff и редактировать одобренные конфиги</a></p><h3>Предложить проверенные правки через PR</h3><form method=post action=/propose>{hidden}<p>Используется только repository.authoring_path из локального agent.yml.</p><p>Целевая ветка PR берётся из repository.branch.</p><input name=title value='Minecraft configuration update' required><label><input type=checkbox name=reviewed value=yes required>Я проверил локальные изменения</label><button>Создать ветку и PR</button></form><h3>Подключить существующий сервер без перезаписи unit/Java/RCON</h3><form method=post action=/adopt-plan>{hidden}<input name=server required value='{}'><button>Показать adopt-план</button></form><a href='/'>Панель</a>",
         escape(current["repository"]["url"].as_str().unwrap_or("")),
         escape(current["repository"]["branch"].as_str().unwrap_or("main")),
         escape(current["paths"]["server"].as_str().unwrap_or(""))
@@ -264,6 +264,196 @@ fn review_html(
         "<h2>План — проверьте перед применением</h2><pre>{}</pre><form method=post action='{action}'><input type=hidden name=csrf value='{csrf}'><input type=hidden name=digest value='{digest}'>{extra}<label><input type=checkbox name=reviewed value=yes required>Я проверил план</label><button>Применить этот план</button></form><a href='/onboarding'>Назад</a>",
         escape(&serde_json::to_string_pretty(plan)?)
     ))
+}
+const EDIT_BYTES: u64 = 64 * 1024;
+struct AuthoringLock(std::fs::File);
+impl Drop for AuthoringLock {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.0);
+    }
+}
+fn authoring_lock(repo: &Path) -> Result<AuthoringLock> {
+    let path = crate::deploy::safe_path(repo, ".git/gitcraft-propose.lock")?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)?;
+    fs2::FileExt::try_lock_exclusive(&file)
+        .context("authoring clone is busy with another edit or proposal")?;
+    Ok(AuthoringLock(file))
+}
+fn authoring_file(repo: &Path, relative: &str) -> Result<(PathBuf, String, String)> {
+    let approved = crate::policy::editable_paths(repo)?;
+    anyhow::ensure!(
+        approved.iter().any(|p| p == relative),
+        "file is not an explicitly approved editable configuration"
+    );
+    crate::policy::config_path(relative)?;
+    let path = crate::deploy::safe_path(repo, relative)?;
+    anyhow::ensure!(
+        path.is_file() && fs::metadata(&path)?.len() <= EDIT_BYTES,
+        "editor accepts regular UTF-8 files up to 64 KiB; use CLI for larger configs"
+    );
+    let content = fs::read_to_string(&path)?;
+    crate::policy::validate_config_file(relative, &content).map_err(|_| {
+        anyhow::anyhow!("configuration rejected by shared policy; contents omitted")
+    })?;
+    let hash = hex::encode(Sha256::digest(content.as_bytes()));
+    Ok((path, content, hash))
+}
+fn head_content(repo: &Path, relative: &str) -> Result<String> {
+    let output = crate::gitrepo::run_bounded(
+        std::process::Command::new("git").current_dir(repo).args([
+            "-c",
+            "core.hooksPath=/dev/null",
+            "show",
+            "--no-ext-diff",
+            "--no-textconv",
+            &format!("HEAD:{relative}"),
+        ]),
+        Duration::from_secs(10),
+    )?;
+    anyhow::ensure!(
+        output.status.success() && output.stdout.len() as u64 <= EDIT_BYTES,
+        "tracked HEAD config unavailable or too large for editor"
+    );
+    let content = String::from_utf8(output.stdout)?;
+    crate::policy::validate_config_file(relative, &content).map_err(|_| {
+        anyhow::anyhow!("historical configuration rejected by policy; diff and values omitted")
+    })?;
+    Ok(content)
+}
+fn authoring_head(repo: &Path) -> Result<String> {
+    let output = crate::gitrepo::run_bounded(
+        std::process::Command::new("git").current_dir(repo).args([
+            "rev-parse",
+            "--verify",
+            "HEAD^{commit}",
+        ]),
+        Duration::from_secs(10),
+    )?;
+    anyhow::ensure!(output.status.success(), "authoring HEAD unavailable");
+    Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+}
+fn authoring_connection(current: &Value) -> Value {
+    json!({"url":current["repository"]["url"],"branch":current["repository"]["branch"],"authoring_path":current["repository"]["authoring_path"]})
+}
+fn text_diff(relative: &str, before: &str, after: &str) -> String {
+    let mut diff = format!(
+        "--- HEAD/{relative}\n+++ proposed/{relative}\n@@ -1,{} +1,{} @@\n",
+        before.lines().count(),
+        after.lines().count()
+    );
+    for line in before.lines() {
+        diff.push('-');
+        diff.push_str(line);
+        diff.push('\n');
+    }
+    for line in after.lines() {
+        diff.push('+');
+        diff.push_str(line);
+        diff.push('\n');
+    }
+    diff
+}
+fn editor_list(current: &Value, csrf: &str) -> Result<String> {
+    let repo = crate::repository::authoring_repository(current)?;
+    let _guard = authoring_lock(&repo)?;
+    let paths = crate::policy::editable_paths(&repo)?;
+    let mut html = format!(
+        "<h2>Редактор конфигов через отдельный рабочий клон</h2><p>{}</p><p>До 64 KiB на файл. Только существующие явно одобренные конфиги. Сохранение меняет рабочий клон; production обновится после PR и merge.</p>",
+        escape(&repo.to_string_lossy())
+    );
+    for relative in paths {
+        html.push_str(&format!("<form method=post action=/editor-open><input type=hidden name=csrf value='{csrf}'><input type=hidden name=file value='{}'><button>{}</button></form>",escape(&relative),escape(&relative)));
+    }
+    html.push_str("<a href='/onboarding'>PR и подключение</a>");
+    Ok(html)
+}
+fn editor_open(current: &Value, csrf: &str, relative: &str) -> Result<String> {
+    let repo = crate::repository::authoring_repository(current)?;
+    let _guard = authoring_lock(&repo)?;
+    let (_, content, hash) = authoring_file(&repo, relative)?;
+    let original = head_content(&repo, relative)?;
+    Ok(format!(
+        "<h2>{}</h2><h3>Текущие изменения относительно HEAD</h3><pre>{}</pre><form method=post action=/editor-preview><input type=hidden name=csrf value='{csrf}'><input type=hidden name=file value='{}'><input type=hidden name=oldhash value='{hash}'><textarea name=content maxlength=65536>{}</textarea><button>Проверить и показать diff</button></form><a href='/editor'>Файлы</a>",
+        escape(relative),
+        escape(&text_diff(relative, &original, &content)),
+        escape(relative),
+        escape(&content)
+    ))
+}
+fn editor_preview(current: &Value, csrf: &str, form: &HashMap<String, String>) -> Result<String> {
+    let repo = crate::repository::authoring_repository(current)?;
+    let _guard = authoring_lock(&repo)?;
+    let relative = form.get("file").context("file missing")?;
+    let (_, _, oldhash) = authoring_file(&repo, relative)?;
+    anyhow::ensure!(
+        form.get("oldhash") == Some(&oldhash),
+        "file changed; reopen before editing"
+    );
+    let content = form.get("content").context("content missing")?;
+    anyhow::ensure!(
+        content.len() as u64 <= EDIT_BYTES,
+        "editor content exceeds 64 KiB"
+    );
+    crate::policy::validate_config_file(relative, content).map_err(|_| {
+        anyhow::anyhow!("proposed configuration rejected by policy; contents omitted")
+    })?;
+    let original = head_content(&repo, relative)?;
+    let plan = json!({"repository":repo,"connection":authoring_connection(current),"head":authoring_head(&repo)?,"file":relative,"oldhash":oldhash,"content":content});
+    let digest = write_ui_plan(&ui_plan_path(current, "ui-edit.json")?, &plan)?;
+    Ok(format!(
+        "<h2>Проверьте изменения</h2><pre>{}</pre><form method=post action=/editor-save><input type=hidden name=csrf value='{csrf}'><input type=hidden name=digest value='{digest}'><label><input type=checkbox name=reviewed value=yes required>Я проверил diff</label><button>Сохранить в рабочем клоне</button></form>",
+        escape(&text_diff(relative, &original, content))
+    ))
+}
+fn editor_save(current: &Value, form: &HashMap<String, String>) -> Result<String> {
+    use std::io::Write;
+    let plan_path = ui_plan_path(current, "ui-edit.json")?;
+    let plan = reviewed_plan(&plan_path, form)?;
+    let repo = crate::repository::authoring_repository(current)?;
+    anyhow::ensure!(
+        plan["repository"].as_str() == repo.to_str(),
+        "authoring path changed; review a fresh plan"
+    );
+    let _guard = authoring_lock(&repo)?;
+    anyhow::ensure!(
+        plan["connection"] == authoring_connection(current)
+            && plan["head"] == authoring_head(&repo)?,
+        "repository connection or HEAD changed; review a fresh plan"
+    );
+    let relative = plan["file"].as_str().context("planned file missing")?;
+    let (path, before, oldhash) = authoring_file(&repo, relative)?;
+    anyhow::ensure!(
+        plan["oldhash"] == oldhash,
+        "file changed after preview; no overwrite performed"
+    );
+    let content = plan["content"]
+        .as_str()
+        .context("planned content missing")?;
+    anyhow::ensure!(
+        content.len() as u64 <= EDIT_BYTES,
+        "planned content exceeds editor limit"
+    );
+    crate::policy::validate_config_file(relative, content)
+        .map_err(|_| anyhow::anyhow!("planned content rejected; values omitted"))?;
+    let persist = |bytes: &[u8]| -> Result<()> {
+        let mut tmp = tempfile::NamedTempFile::new_in(path.parent().context("file parent")?)?;
+        tmp.write_all(bytes)?;
+        tmp.as_file().sync_all()?;
+        tmp.persist(&path)?;
+        std::fs::File::open(path.parent().unwrap())?.sync_all()?;
+        Ok(())
+    };
+    persist(content.as_bytes())?;
+    if crate::policy::validate_repository(&repo).is_err() {
+        persist(before.as_bytes())?;
+        bail!("repository policy rejected save; previous content restored and values omitted");
+    }
+    fs::remove_file(plan_path)?;
+    Ok("<p>Сохранено только в отдельном рабочем клоне. Проверьте diff и создайте PR.</p><a href='/editor'>Проверить изменения</a> · <a href='/onboarding'>Создать PR</a>".into())
 }
 
 pub fn serve(path: &Path) -> Result<()> {
@@ -342,6 +532,25 @@ pub fn serve(path: &Path) -> Result<()> {
             }
             continue;
         }
+        if method == "GET" && url == "/editor" {
+            if let Some(csrf) = csrf {
+                match editor_list(&config::load(path)?, &csrf) {
+                    Ok(html) => respond(request, 200, html, None),
+                    Err(error) => respond(
+                        request,
+                        400,
+                        format!(
+                            "<p>{}</p><a href='/onboarding'>Подключение</a>",
+                            escape(&error.to_string())
+                        ),
+                        None,
+                    ),
+                }
+            } else {
+                respond(request, 403, "Login required".into(), None);
+            }
+            continue;
+        }
         if method == "GET" && url == "/" {
             if let Some(csrf) = csrf {
                 let current = config::load(path)?;
@@ -372,17 +581,22 @@ pub fn serve(path: &Path) -> Result<()> {
             respond(request, 403, "Forbidden origin".into(), None);
             continue;
         }
-        if request.body_length().is_none_or(|n| n > 16384) {
+        let body_limit = if url == "/editor-preview" {
+            256 * 1024
+        } else {
+            16384
+        };
+        if request.body_length().is_none_or(|n| n > body_limit) {
             respond(request, 413, "Invalid body length".into(), None);
             continue;
         }
         let mut body = String::new();
         if request
             .as_reader()
-            .take(16385)
+            .take(body_limit as u64 + 1)
             .read_to_string(&mut body)
             .is_err()
-            || body.len() > 16384
+            || body.len() > body_limit
         {
             respond(request, 400, "Invalid body".into(), None);
             continue;
@@ -425,6 +639,32 @@ pub fn serve(path: &Path) -> Result<()> {
             continue;
         }
         match url.as_str() {
+            "/editor-open" | "/editor-preview" | "/editor-save" => {
+                let result = (|| -> Result<String> {
+                    let current = config::load(path)?;
+                    let csrf = csrf.as_deref().context("session missing")?;
+                    match url.as_str() {
+                        "/editor-open" => {
+                            editor_open(&current, csrf, form.get("file").context("file missing")?)
+                        }
+                        "/editor-preview" => editor_preview(&current, csrf, &form),
+                        "/editor-save" => editor_save(&current, &form),
+                        _ => bail!("unknown edit action"),
+                    }
+                })();
+                match result {
+                    Ok(html) => respond(request, 200, html, None),
+                    Err(error) => respond(
+                        request,
+                        400,
+                        format!(
+                            "<p>Ошибка: {}</p><a href='/editor'>Назад</a>",
+                            escape(&error.to_string())
+                        ),
+                        None,
+                    ),
+                }
+            }
             "/onboarding-plan" | "/onboarding-apply" | "/export-plan" | "/export-apply"
             | "/adopt-plan" | "/adopt-apply" => {
                 let outcome = (|| -> Result<String> {
@@ -555,15 +795,17 @@ pub fn serve(path: &Path) -> Result<()> {
                 }
                 let busy = busy.clone();
                 let path = path.to_path_buf();
-                let repo = PathBuf::from(form.get("repository").cloned().unwrap_or_default());
-                let base = form.get("base").cloned().unwrap_or_default();
                 let title = form.get("title").cloned().unwrap_or_default();
                 std::thread::spawn(move || {
                     let outcome = (|| -> Result<()> {
                         let current = config::load(&path)?;
                         let target = ui_plan_path(&current, "ui-operation.json")?;
                         write_ui_plan(&target, &json!({"status":"running","operation":"propose"}))?;
-                        let result = crate::repository::propose(&repo, &base, &title);
+                        let base = current["repository"]["branch"]
+                            .as_str()
+                            .context("configured branch missing")?;
+                        let result = crate::repository::authoring_repository(&current)
+                            .and_then(|repo| crate::repository::propose(&repo, base, &title));
                         let value = match result {
                             Ok(result) => json!({"status":"complete","result":result}),
                             Err(error) => json!({"status":"error","error":error.to_string()}),
@@ -669,5 +911,199 @@ mod tests {
         assert!(equal("abc", "abc"));
         assert!(!equal("abc", "abd"));
         assert_ne!(random(), random());
+    }
+    fn edit_fixture(content: &str) -> (tempfile::TempDir, Value, PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("authoring");
+        fs::create_dir_all(repo.join("plugins-configs/Foo")).unwrap();
+        fs::write(repo.join("plugins-configs/Foo/config.yml"), content).unwrap();
+        fs::write(
+            repo.join("export-policy.json"),
+            json!({"approved_config_paths":["plugins-configs/Foo/config.yml"]}).to_string(),
+        )
+        .unwrap();
+        for args in [
+            vec!["init", "--initial-branch=main"],
+            vec![
+                "config",
+                "remote.origin.url",
+                "git@github.com:team/config.git",
+            ],
+            vec![
+                "add",
+                "plugins-configs/Foo/config.yml",
+                "export-policy.json",
+            ],
+            vec![
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.org",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                "fixture",
+            ],
+        ] {
+            let status = std::process::Command::new("git")
+                .current_dir(&repo)
+                .args(args)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        let paths: serde_json::Map<_, _> = [
+            "repository",
+            "server",
+            "state",
+            "cache",
+            "staging",
+            "backups",
+        ]
+        .into_iter()
+        .map(|key| (key.into(), json!(root.path().join(key))))
+        .collect();
+        let config=crate::config::validate(json!({"repository":{"url":"git@github.com:team/config.git","authoring_path":repo},"paths":paths})).unwrap();
+        (root, config, repo)
+    }
+    fn edit_plan(config: &Value, repo: &Path, content: &str) -> (HashMap<String, String>, String) {
+        let oldhash = hex::encode(Sha256::digest(
+            fs::read(repo.join("plugins-configs/Foo/config.yml")).unwrap(),
+        ));
+        let form = HashMap::from([
+            ("file".into(), "plugins-configs/Foo/config.yml".into()),
+            ("oldhash".into(), oldhash),
+            ("content".into(), content.into()),
+        ]);
+        let html = editor_preview(config, "csrf", &form).unwrap();
+        let bytes = fs::read(ui_plan_path(config, "ui-edit.json").unwrap()).unwrap();
+        let digest = hex::encode(Sha256::digest(bytes));
+        (
+            HashMap::from([("reviewed".into(), "yes".into()), ("digest".into(), digest)]),
+            html,
+        )
+    }
+    #[test]
+    fn editor_escapes_preview_saves_only_reviewed_clone_and_guards_stale_hash() {
+        let (_root, config, repo) = edit_fixture("message: hello\n");
+        let (form, html) = edit_plan(
+            &config,
+            &repo,
+            "message: '</textarea><script>alert(1)</script>'\n",
+        );
+        assert!(!html.contains("</textarea><script>"));
+        assert!(html.contains("&lt;script&gt;"));
+        assert!(editor_save(&config, &HashMap::new()).is_err());
+        editor_save(&config, &form).unwrap();
+        assert!(
+            fs::read_to_string(repo.join("plugins-configs/Foo/config.yml"))
+                .unwrap()
+                .contains("<script>")
+        );
+        let (form, _) = edit_plan(&config, &repo, "message: new\n");
+        fs::write(
+            repo.join("plugins-configs/Foo/config.yml"),
+            "message: concurrent\n",
+        )
+        .unwrap();
+        assert!(editor_save(&config, &form).is_err());
+        assert!(
+            fs::read_to_string(repo.join("plugins-configs/Foo/config.yml"))
+                .unwrap()
+                .contains("concurrent")
+        );
+    }
+    #[test]
+    fn editor_rechecks_policy_authoring_path_and_secret_history() {
+        let (_root, config, repo) = edit_fixture("message: hello\n");
+        let (form, _) = edit_plan(&config, &repo, "message: new\n");
+        fs::write(
+            repo.join("export-policy.json"),
+            json!({"approved_config_paths":[]}).to_string(),
+        )
+        .unwrap();
+        assert!(editor_save(&config, &form).is_err());
+        let (_root, config, repo) = edit_fixture("api-token: historical-secret\n");
+        fs::write(
+            repo.join("plugins-configs/Foo/config.yml"),
+            "message: sanitized\n",
+        )
+        .unwrap();
+        let error = editor_open(&config, "csrf", "plugins-configs/Foo/config.yml")
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains("historical-secret"));
+        assert!(error.contains("historical"));
+        let (_root, config, repo) = edit_fixture("message: hello\n");
+        let (form, _) = edit_plan(&config, &repo, "message: new\n");
+        let mut changed = config.clone();
+        changed["repository"]["authoring_path"] = json!(repo.parent().unwrap().join("other"));
+        assert!(editor_save(&changed, &form).is_err());
+    }
+    #[test]
+    fn editor_plan_is_bound_to_connection_and_git_head() {
+        let (_root, config, repo) = edit_fixture("message: hello\n");
+        let (form, _) = edit_plan(&config, &repo, "message: new\n");
+        let mut changed = config.clone();
+        changed["repository"]["branch"] = json!("release");
+        assert!(editor_save(&changed, &form).is_err());
+        let result = std::process::Command::new("git")
+            .current_dir(&repo)
+            .args([
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.org",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "other checkout state",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(result.success());
+        assert!(editor_save(&config, &form).is_err());
+    }
+    #[test]
+    fn editor_rejects_traversal_symlinks_unapproved_paths_oversize_and_secrets() {
+        let (_root, config, repo) = edit_fixture("message: hello\n");
+        for path in [
+            "../outside.yml",
+            ".github/workflows/ci.yml",
+            "requirements/engine.json",
+            "plugins-configs/Unknown/config.yml",
+        ] {
+            assert!(editor_open(&config, "csrf", path).is_err());
+        }
+        let (_, _, oldhash) = authoring_file(&repo, "plugins-configs/Foo/config.yml").unwrap();
+        for content in ["a".repeat(65537), "api-token: proposed-secret".into()] {
+            let form = HashMap::from([
+                ("file".into(), "plugins-configs/Foo/config.yml".into()),
+                ("oldhash".into(), oldhash.clone()),
+                ("content".into(), content),
+            ]);
+            let error = editor_preview(&config, "csrf", &form)
+                .unwrap_err()
+                .to_string();
+            assert!(!error.contains("proposed-secret"));
+        }
+        fs::remove_file(repo.join("plugins-configs/Foo/config.yml")).unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", repo.join("plugins-configs/Foo/config.yml"))
+            .unwrap();
+        assert!(editor_open(&config, "csrf", "plugins-configs/Foo/config.yml").is_err());
+        let mut overlap = config.clone();
+        overlap["repository"]["authoring_path"] = config["paths"]["server"].clone();
+        assert!(crate::config::validate(overlap).is_err());
     }
 }
