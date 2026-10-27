@@ -46,6 +46,7 @@ if [[ "$dry_run" == true ]]; then
 fi
 ((EUID==0)) || { printf '%s\n' 'Run with sudo or inspect --dry-run.' >&2; exit 2; }
 [[ -d /run/systemd/system ]] || { printf '%s\n' 'A running systemd host is required.' >&2; exit 2; }
+[[ -x /usr/bin/busctl ]] || { printf '%s\n' 'busctl from the distribution systemd package is required for structured launcher verification. Install it before retrying.' >&2; exit 2; }
 reject_symlinks(){ local path=$1 current='' part; local -a parts; IFS='/' read -r -a parts <<< "$path"; for part in "${parts[@]}"; do [[ -n "$part" ]] || continue; current="$current/$part"; [[ ! -L "$current" ]] || { printf 'Refusing installation symlink: %s\n' "$current" >&2; exit 2; }; done; }
 for path in /opt/gitcraft/bin/gitcraft /etc/gitcraft/config/agent.yml /etc/gitcraft/secrets.env /etc/gitcraft/java.env /etc/gitcraft/ssh.conf /var/lib/minecraft/.ssh/id_ed25519 /var/lib/minecraft/.ssh/id_ed25519.pub /etc/sudoers.d/gitcraft /etc/systemd/system/gitcraft-agent.service /etc/systemd/system/gitcraft-web.service "/etc/systemd/system/$service" "$server_dir"; do reject_symlinks "$path"; done
 for directory in repository state cache staging backups; do reject_symlinks "/var/lib/minecraft/$directory"; done
@@ -124,7 +125,6 @@ if [[ ! -e /etc/gitcraft/secrets.env ]]; then
   printf 'MINECRAFT_RCON_PASSWORD="%s"\nGITCRAFT_WEB_TOKEN=%s\n' "$escaped" "$(openssl rand -hex 32)" > /etc/gitcraft/secrets.env
 fi
 chown root:root /etc/gitcraft/secrets.env; chmod 0600 /etc/gitcraft/secrets.env
-if [[ "$mode" == new && ! -e /etc/gitcraft/java.env ]]; then printf '%s\n' 'JAVA_OPTS=-Xms1G -Xmx2G' > /etc/gitcraft/java.env; chmod 0644 /etc/gitcraft/java.env; fi
 install -d -m 0700 -o "$runtime_user" -g "$runtime_group" /var/lib/minecraft/.ssh
 if [[ ! -e /var/lib/minecraft/.ssh/id_ed25519 ]]; then runuser -u "$runtime_user" -- ssh-keygen -q -t ed25519 -N '' -C gitcraft-read-only -f /var/lib/minecraft/.ssh/id_ed25519; fi
 cat > /etc/gitcraft/ssh.conf <<'SSHCONFIG'

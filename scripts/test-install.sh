@@ -7,6 +7,11 @@ printf '%s\n' 'ID=debian' 'VERSION_ID="13"' > "$temporary/os-release"
 bash -n "$script_dir/install.sh"
 bash -n "$script_dir/bootstrap-repo.sh"
 bash -n "$script_dir/bootstrap-server.sh"
+# Fresh units must be understood exactly through structured ExecStartEx argv;
+# variable expansion is deliberately not inferred by the deployment verifier.
+rendered=$(sed -e 's|/usr/bin/java |/opt/java/bin/java |' -e 's|server.jar nogui|custom-paper.jar nogui|' "$script_dir/../systemd/minecraft.service")
+[[ "$rendered" == *'ExecStart=/opt/java/bin/java -Xms1G -Xmx2G -jar custom-paper.jar nogui'* ]]
+[[ "$rendered" != *'$JAVA_OPTS'* && "$rendered" != *'EnvironmentFile=/etc/gitcraft/java.env'* ]]
 "$script_dir/install.sh" --repository git@github.com:team/config.git --dry-run --os-release "$temporary/os-release" > "$temporary/plan"
 grep -Fq 'firewall and SSH configuration unchanged' "$temporary/plan"
 # os-release content is data, including attempted command substitutions.
