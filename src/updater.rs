@@ -188,8 +188,11 @@ fn select_release<'a>(artifact: &Value, versions: &'a [Value]) -> Result<Option<
 }
 
 fn update_artifact(client: &Client, artifact: &mut Value) -> Result<Option<Value>> {
+    if artifact["pinned"]["transfer"] == true {
+        return Ok(None);
+    }
     match artifact["source"]["provider"].as_str().unwrap_or("direct") {
-        "direct" => return Ok(None),
+        "direct" | "transfer" => return Ok(None),
         "modrinth" => (),
         _ => bail!("unsupported update provider"),
     }
@@ -319,5 +322,16 @@ mod tests {
         assert!(
             release_file(&json!({"files":[{"filename":"a.jar"},{"filename":"b.jar"}]})).is_err()
         );
+    }
+    #[test]
+    fn transferred_pins_are_unchanged_without_network() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("requirements")).unwrap();
+        let path = dir.path().join("requirements/engine.json");
+        let bytes=json!({"name":"LocalEngine","filename":"custom.jar","pinned":{"transfer":true,"version":"local-1","sha256":"a".repeat(64)},"source":{"provider":"transfer"}}).to_string();
+        std::fs::write(&path, &bytes).unwrap();
+        let result = update_repository(dir.path()).unwrap();
+        assert_eq!(result, json!({"changed":[],"updates":[]}));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), bytes);
     }
 }
