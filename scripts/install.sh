@@ -64,7 +64,7 @@ else
 fi
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
-apt-get install -y --no-install-recommends git openssh-client sudo ca-certificates openssl
+apt-get install -y --no-install-recommends git openssh-client sudo ca-certificates openssl jq
 if [[ "$mode" == new ]]; then
   java_major=0
   if [[ -x "$java_path" ]]; then java_version=$("$java_path" -version 2>&1 | head -n 1); if [[ "$java_version" =~ \"([0-9]+) ]]; then java_major=${BASH_REMATCH[1]}; fi; fi

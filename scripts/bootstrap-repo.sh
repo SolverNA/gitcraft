@@ -53,7 +53,7 @@ while IFS= read -r -d '' file; do
   mkdir -p -- "$(dirname -- "$relative")"
   cp -- "$file" "$relative"
 done < <(find "$template_dir" -type f -print0)
-git add -- .github requirements server-settings .gitignore README.md
+git add -- .github requirements server-settings .gitignore README.md export-policy.json
 if git diff --cached --quiet; then printf '%s\n' 'No template changes to propose.'; exit 0; fi
 git -c user.name=gitcraft-setup -c user.email=gitcraft-setup@users.noreply.github.com commit -m 'chore: initialize Minecraft GitOps configuration'
 git -c credential.helper='!gh auth git-credential' push origin "HEAD:refs/heads/$branch"

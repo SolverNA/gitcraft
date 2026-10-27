@@ -32,4 +32,6 @@ while IFS='=' read -r name value; do
 done < /etc/gitcraft/secrets.env
 export GITCRAFT_SSH_CONFIG=/etc/gitcraft/ssh.conf
 runuser -u minecraft -- /opt/gitcraft/bin/gitcraft bootstrap --config /etc/gitcraft/config/agent.yml --accept-eula
-systemctl enable --now minecraft.service gitcraft-agent.service
+service=$(/opt/gitcraft/bin/gitcraft status --config /etc/gitcraft/config/agent.yml | jq -er '.service')
+if [[ ! "$service" =~ ^[A-Za-z0-9][A-Za-z0-9_.@-]*\.service$ ]]; then printf '%s\n' 'Invalid configured Minecraft service.' >&2; exit 2; fi
+systemctl enable --now "$service" gitcraft-agent.service
