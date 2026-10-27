@@ -258,14 +258,27 @@ fn capacity(config: &Value, root: &Path, additional: u64) -> Result<()> {
         if !path.is_dir() || path.is_symlink() {
             continue;
         }
-        if let Ok(bytes) = fs::read(path.join("session.json")) {
-            let s: Session = serde_json::from_slice(&bytes)?;
-            if s.status != "committed" {
-                for f in s.manifest.files {
-                    reserved = reserved.checked_add(f.size).context("quota overflow")?;
+        let staged = staged_bytes(&path.join("data"))?;
+        let declared = match fs::read(path.join("session.json")) {
+            Ok(bytes) => {
+                let s: Session = serde_json::from_slice(&bytes)?;
+                if s.status == "committed" {
+                    0
+                } else {
+                    s.manifest
+                        .files
+                        .iter()
+                        .try_fold(0u64, |n, f| n.checked_add(f.size).context("quota overflow"))?
                 }
             }
-        }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => return Err(error.into()),
+        };
+        // Completed sessions retain their verified data. Count those actual bytes,
+        // as well as orphan/partial chunks, instead of freeing a fictional quota.
+        reserved = reserved
+            .checked_add(staged.max(declared))
+            .context("quota overflow")?;
     }
     ensure!(
         reserved.checked_add(additional).context("quota overflow")?
@@ -279,6 +292,25 @@ fn capacity(config: &Value, root: &Path, additional: u64) -> Result<()> {
     );
     Ok(())
 }
+fn staged_bytes(path: &Path) -> Result<u64> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error.into()),
+    };
+    ensure!(
+        !metadata.file_type().is_symlink(),
+        "staging symlink forbidden"
+    );
+    if metadata.is_file() {
+        return Ok(metadata.len());
+    }
+    ensure!(metadata.is_dir(), "special staging file forbidden");
+    fs::read_dir(path)?.try_fold(0u64, |n, entry| {
+        n.checked_add(staged_bytes(&entry?.path())?)
+            .context("quota overflow")
+    })
+}
 pub fn create(config: &Value, manifest: Manifest) -> Result<Value> {
     let bytes = validate_manifest(config, &manifest)?;
     let base = root(config)?;
@@ -289,6 +321,12 @@ pub fn create(config: &Value, manifest: Manifest) -> Result<Value> {
     let dir = session_dir(config, &id)?;
     fs::create_dir(&dir)?;
     fs::create_dir(dir.join("data"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+        fs::set_permissions(dir.join("data"), fs::Permissions::from_mode(0o700))?;
+    }
     let count = manifest.files.len();
     let s = Session {
         id: id.clone(),
@@ -892,5 +930,24 @@ mod tests {
         let second = lock(&path).unwrap();
         drop(second);
         drop(inherited);
+    }
+    #[test]
+    fn retained_committed_and_partial_bytes_still_consume_staging_quota() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = config(dir.path());
+        config["transfer"]["max_session_bytes"] = json!(10);
+        config["transfer"]["max_staging_bytes"] = json!(6);
+        let session = create(&config, manifest(b"abc")).unwrap();
+        let id = session["id"].as_str().unwrap();
+        let token = session["token"].as_str().unwrap();
+        chunk(&config, id, token, 0, 0, &hash(b"abc"), b"abc").unwrap();
+        let (path, mut saved) = load(&config, id, token).unwrap();
+        saved.status = "committed".into();
+        save(&path, &saved).unwrap();
+        assert!(create(&config, manifest(b"four")).is_err());
+        // Simulate extra persisted bytes after an interrupted write: actual disk
+        // usage is counted even if the session metadata no longer reserves it.
+        fs::write(path.join("data/partial.tmp"), b"1234").unwrap();
+        assert!(create(&config, manifest(b"x")).is_err());
     }
 }
