@@ -173,7 +173,13 @@ fn inspect_text(text: &str) -> Result<()> {
                 !rest.split('/').next().unwrap_or("").contains('@'),
                 "Credential-bearing URL is forbidden (value omitted)"
             );
-            if let Ok(url) = reqwest::Url::parse(part) {
+            let url_text = part
+                .find("https://")
+                .or_else(|| part.find("http://"))
+                .map(|offset| &part[offset..])
+                .unwrap_or(part)
+                .trim_matches(['\'', '"', ',']);
+            if let Ok(url) = reqwest::Url::parse(url_text) {
                 ensure!(
                     !url.query_pairs().any(|(key, _)| sensitive(&key)),
                     "Credential-like URL parameter is forbidden (value omitted)"
@@ -460,6 +466,13 @@ mod tests {
             .to_string();
         assert!(!err.contains("do-not-leak"));
         assert!(validate_config_file("config/foo.toml", "password = 'hidden'").is_err());
+        assert!(
+            validate_config_file(
+                "server-settings/server.properties",
+                "resource-pack=https://example.invalid/pack?token=do-not-leak"
+            )
+            .is_err()
+        );
     }
     #[test]
     fn custom_world_names_and_markers() {
