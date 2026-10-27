@@ -200,16 +200,47 @@ fn write_properties(source: Option<&Path>, dest: &Path, client: &RconClient) -> 
     temp.persist(dest)?;
     Ok(())
 }
-fn wait_healthy(client: &RconClient, name: &str, timeout: u64) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(timeout);
-    loop {
-        if service("is-active", name)?.status.success() && client.online().is_ok() {
-            return Ok(());
+trait Runtime {
+    fn online(&mut self) -> Result<u32>;
+    fn command(&mut self, command: &str) -> Result<String>;
+    fn service(&mut self, action: &str, name: &str) -> Result<Output>;
+    fn snapshot(
+        &mut self,
+        url: &str,
+        branch: &str,
+        repository: &Path,
+        staging: &Path,
+    ) -> Result<(String, PathBuf)> {
+        gitrepo::snapshot(url, branch, repository, staging)
+    }
+    fn download(&mut self, artifact: &artifacts::Artifact, cache: &Path) -> Result<PathBuf> {
+        artifacts::download(artifact, cache)
+    }
+    fn healthy(&mut self, name: &str, timeout: u64) -> Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(timeout);
+        loop {
+            if self.service("is-active", name)?.status.success() && self.online().is_ok() {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                bail!("Minecraft readiness timed out");
+            }
+            thread::sleep(Duration::from_secs(1));
         }
-        if Instant::now() >= deadline {
-            bail!("Minecraft readiness timed out");
-        }
-        thread::sleep(Duration::from_secs(1));
+    }
+}
+struct LiveRuntime<'a> {
+    client: &'a RconClient,
+}
+impl Runtime for LiveRuntime<'_> {
+    fn online(&mut self) -> Result<u32> {
+        self.client.online()
+    }
+    fn command(&mut self, command: &str) -> Result<String> {
+        self.client.command(command)
+    }
+    fn service(&mut self, action: &str, name: &str) -> Result<Output> {
+        service(action, name)
     }
 }
 fn paths(config: &Value, key: &str) -> Result<PathBuf> {
@@ -235,6 +266,20 @@ fn client(config: &Value) -> Result<RconClient> {
     })
 }
 fn run_inner(config: &Value, bootstrap: bool) -> Result<Value> {
+    let client = client(config)?;
+    run_transaction(
+        config,
+        bootstrap,
+        &client,
+        &mut LiveRuntime { client: &client },
+    )
+}
+fn run_transaction(
+    config: &Value,
+    bootstrap: bool,
+    client: &RconClient,
+    runtime: &mut impl Runtime,
+) -> Result<Value> {
     let server = paths(config, "server")?;
     let state_dir = paths(config, "state")?;
     let backup_root = paths(config, "backups")?;
@@ -257,18 +302,17 @@ fn run_inner(config: &Value, bootstrap: bool) -> Result<Value> {
         json!({})
     };
     let name = text(config, "deployment", "service")?;
-    let client = client(config)?;
     if bootstrap {
         if state_file.exists() {
             bail!("Bootstrap forbidden after a successful deployment");
         }
-        let status = service("is-active", name)?;
+        let status = runtime.service("is-active", name)?;
         let status_text = String::from_utf8_lossy(&status.stdout);
         if status.status.success() || !["inactive", "failed"].contains(&status_text.trim()) {
             bail!("Bootstrap requires explicitly inactive or failed Minecraft service");
         }
     }
-    let (commit, repo) = gitrepo::snapshot(
+    let (commit, repo) = runtime.snapshot(
         text(config, "repository", "url")?,
         config["repository"]["branch"].as_str().unwrap_or("main"),
         &paths(config, "repository")?,
@@ -290,7 +334,7 @@ fn run_inner(config: &Value, bootstrap: bool) -> Result<Value> {
         bail!("An engine manifest is required");
     }
     for artifact in &manifest {
-        let cached = artifacts::download(artifact, &paths(config, "cache")?)?;
+        let cached = runtime.download(artifact, &paths(config, "cache")?)?;
         if sources
             .insert(artifact.destination.clone(), cached)
             .is_some()
@@ -326,7 +370,7 @@ fn run_inner(config: &Value, bootstrap: bool) -> Result<Value> {
     }
     if !bootstrap
         && !wait_empty(
-            || client.online(),
+            || runtime.online(),
             Duration::from_secs(seconds(config, "empty_grace_seconds", 60)),
         )?
     {
@@ -336,8 +380,8 @@ fn run_inner(config: &Value, bootstrap: bool) -> Result<Value> {
     let backup = backup_root.join(format!("{commit}-{}", timestamp()));
     fs::create_dir_all(&backup)?;
     if !bootstrap {
-        client.command("save-all flush")?;
-        service("stop", name)?;
+        runtime.command("save-all flush")?;
+        runtime.service("stop", name)?;
     }
     let mut existed = BTreeSet::new();
     let backup_result = (|| -> Result<()> {
@@ -357,7 +401,7 @@ fn run_inner(config: &Value, bootstrap: bool) -> Result<Value> {
     })();
     if let Err(error) = backup_result {
         if !bootstrap {
-            service("start", name)?;
+            runtime.service("start", name)?;
         }
         return Err(error.context("Backup failed before mutation"));
     }
@@ -376,24 +420,16 @@ fn run_inner(config: &Value, bootstrap: bool) -> Result<Value> {
                 fs::remove_file(&dest)?;
             }
         }
-        service("start", name)?;
-        wait_healthy(
-            &client,
-            name,
-            seconds(config, "health_timeout_seconds", 120),
-        )
+        runtime.service("start", name)?;
+        runtime.healthy(name, seconds(config, "health_timeout_seconds", 120))
     })();
     if let Err(error) = applied {
         let rollback = (|| -> Result<()> {
-            service("stop", name)?;
+            runtime.service("stop", name)?;
             restore_owned(&server, &backup, &owned, &existed)?;
             if !bootstrap {
-                service("start", name)?;
-                wait_healthy(
-                    &client,
-                    name,
-                    seconds(config, "health_timeout_seconds", 120),
-                )?;
+                runtime.service("start", name)?;
+                runtime.healthy(name, seconds(config, "health_timeout_seconds", 120))?;
             }
             Ok(())
         })();
@@ -578,5 +614,276 @@ mod transaction_tests {
         one.try_lock_exclusive().unwrap();
         assert!(two.try_lock_exclusive().is_err());
         FileExt::unlock(&one).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+    use std::os::unix::process::ExitStatusExt;
+    struct FakeRuntime {
+        repo: PathBuf,
+        commit: String,
+        online: Option<u32>,
+        actions: Vec<String>,
+        fail_first_readiness: bool,
+        readiness_calls: usize,
+        state: PathBuf,
+    }
+    impl Runtime for FakeRuntime {
+        fn online(&mut self) -> Result<u32> {
+            self.online.context("RCON unavailable")
+        }
+        fn command(&mut self, _: &str) -> Result<String> {
+            Ok("Saved".into())
+        }
+        fn service(&mut self, action: &str, _: &str) -> Result<Output> {
+            self.actions.push(action.into());
+            Ok(Output {
+                status: std::process::ExitStatus::from_raw(0),
+                stdout: b"active\n".to_vec(),
+                stderr: vec![],
+            })
+        }
+        fn snapshot(
+            &mut self,
+            _: &str,
+            _: &str,
+            _: &Path,
+            staging: &Path,
+        ) -> Result<(String, PathBuf)> {
+            let dest = staging.join(&self.commit);
+            let status = Command::new("git")
+                .arg("clone")
+                .arg("--quiet")
+                .arg("--no-local")
+                .arg(&self.repo)
+                .arg(&dest)
+                .status()?;
+            if !status.success() {
+                bail!("Fixture clone failed");
+            }
+            Ok((self.commit.clone(), dest))
+        }
+        fn healthy(&mut self, _: &str, _: u64) -> Result<()> {
+            // Installed state must still describe the previous deployment during readiness.
+            let current: Value =
+                serde_json::from_slice(&fs::read(self.state.join("deployment.json"))?)?;
+            assert_eq!(current["commit"], "previous");
+            self.readiness_calls += 1;
+            if self.fail_first_readiness && self.readiness_calls == 1 {
+                bail!("Readiness failed");
+            }
+            Ok(())
+        }
+    }
+    struct Fixture {
+        _root: tempfile::TempDir,
+        config: Value,
+        client: RconClient,
+        runtime: FakeRuntime,
+    }
+    impl Fixture {
+        fn new() -> Self {
+            let root = tempfile::tempdir().unwrap();
+            let repo = root.path().join("source");
+            fs::create_dir_all(repo.join("requirements")).unwrap();
+            fs::create_dir_all(repo.join("server-settings")).unwrap();
+            fs::write(repo.join("server-settings/server.properties"), "motd=new\n").unwrap();
+            let digest = format!("{:x}", sha2::Sha256::digest(b"new jar"));
+            fs::write(repo.join("requirements/engine.json"),serde_json::to_vec(&json!({"name":"engine","filename":"server.jar","pinned":{"url":"https://example.org/server.jar","sha256":digest,"version":"2"}})).unwrap()).unwrap();
+            for args in [
+                vec!["init", "--quiet"],
+                vec!["add", "."],
+                vec![
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.org",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "fixture",
+                ],
+            ] {
+                assert!(
+                    Command::new("git")
+                        .arg("-C")
+                        .arg(&repo)
+                        .args(args)
+                        .status()
+                        .unwrap()
+                        .success()
+                );
+            }
+            let commit = String::from_utf8(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(&repo)
+                    .args(["rev-parse", "HEAD"])
+                    .output()
+                    .unwrap()
+                    .stdout,
+            )
+            .unwrap()
+            .trim()
+            .to_string();
+            let mut path_values = serde_json::Map::new();
+            for key in [
+                "server",
+                "state",
+                "cache",
+                "staging",
+                "backups",
+                "repository",
+            ] {
+                let path = root.path().join(key);
+                fs::create_dir_all(&path).unwrap();
+                path_values.insert(key.into(), json!(path));
+            }
+            let config = json!({"paths":path_values,"repository":{"url":"https://example.org/repo.git","branch":"main"},"deployment":{"service":"minecraft.service","empty_grace_seconds":0,"health_timeout_seconds":1},"rcon":{"host":"127.0.0.1","port":25575,"password_env":"UNUSED","timeout_seconds":1}});
+            let server = paths(&config, "server").unwrap();
+            fs::create_dir_all(server.join("plugins")).unwrap();
+            fs::create_dir_all(server.join("world")).unwrap();
+            fs::write(server.join("server.jar"), "old jar").unwrap();
+            fs::write(server.join("server.properties"), "motd=old\n").unwrap();
+            fs::write(server.join("plugins/old.jar"), "owned").unwrap();
+            fs::write(server.join("plugins/foreign.jar"), "foreign").unwrap();
+            fs::write(server.join("world/level.dat"), "world").unwrap();
+            fs::write(server.join("eula.txt"), "eula=true\n").unwrap();
+            let state = paths(&config, "state").unwrap();
+            atomic_json(&state.join("deployment.json"),&json!({"commit":"previous","managed_files":["server.jar","server.properties","plugins/old.jar","eula.txt"]})).unwrap();
+            fs::write(
+                paths(&config, "cache")
+                    .unwrap()
+                    .join(format!("{digest}.jar")),
+                "new jar",
+            )
+            .unwrap();
+            let client = RconClient {
+                host: "127.0.0.1".into(),
+                port: 25575,
+                password: "local-secret".into(),
+                timeout: Duration::from_secs(1),
+            };
+            Self {
+                _root: root,
+                config,
+                client,
+                runtime: FakeRuntime {
+                    repo,
+                    commit,
+                    online: Some(0),
+                    actions: vec![],
+                    fail_first_readiness: false,
+                    readiness_calls: 0,
+                    state,
+                },
+            }
+        }
+    }
+    use sha2::Digest;
+    #[test]
+    fn successful_transaction_commits_after_readiness_and_retains_eula() {
+        let mut fixture = Fixture::new();
+        let result = run_transaction(
+            &fixture.config,
+            false,
+            &fixture.client,
+            &mut fixture.runtime,
+        )
+        .unwrap();
+        assert_eq!(result["status"], "deployed");
+        assert_eq!(fixture.runtime.readiness_calls, 1);
+        let server = paths(&fixture.config, "server").unwrap();
+        assert_eq!(
+            fs::read_to_string(server.join("server.jar")).unwrap(),
+            "new jar"
+        );
+        assert!(
+            fs::read_to_string(server.join("server.properties"))
+                .unwrap()
+                .contains("local-secret")
+        );
+        assert!(server.join("eula.txt").exists());
+        assert!(!server.join("plugins/old.jar").exists());
+        assert_eq!(
+            fs::read_to_string(server.join("plugins/foreign.jar")).unwrap(),
+            "foreign"
+        );
+        assert_eq!(
+            fs::read_to_string(server.join("world/level.dat")).unwrap(),
+            "world"
+        );
+        let state: Value = serde_json::from_slice(
+            &fs::read(fixture.runtime.state.join("deployment.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(state["commit"], fixture.runtime.commit);
+    }
+    #[test]
+    fn failed_readiness_restores_jar_configs_and_previous_commit() {
+        let mut fixture = Fixture::new();
+        fixture.runtime.fail_first_readiness = true;
+        assert!(
+            run_transaction(
+                &fixture.config,
+                false,
+                &fixture.client,
+                &mut fixture.runtime
+            )
+            .is_err()
+        );
+        let server = paths(&fixture.config, "server").unwrap();
+        assert_eq!(
+            fs::read_to_string(server.join("server.jar")).unwrap(),
+            "old jar"
+        );
+        assert_eq!(
+            fs::read_to_string(server.join("server.properties")).unwrap(),
+            "motd=old\n"
+        );
+        assert!(server.join("plugins/old.jar").exists());
+        assert_eq!(fixture.runtime.readiness_calls, 2);
+        assert_eq!(
+            fixture.runtime.actions,
+            vec!["stop", "start", "stop", "start"]
+        );
+        let state: Value = serde_json::from_slice(
+            &fs::read(fixture.runtime.state.join("deployment.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(state["commit"], "previous");
+    }
+    #[test]
+    fn unavailable_rcon_never_stops_service() {
+        let mut fixture = Fixture::new();
+        fixture.runtime.online = None;
+        assert!(
+            run_transaction(
+                &fixture.config,
+                false,
+                &fixture.client,
+                &mut fixture.runtime
+            )
+            .is_err()
+        );
+        assert!(fixture.runtime.actions.is_empty());
+    }
+    #[test]
+    fn online_players_never_stop_service() {
+        let mut fixture = Fixture::new();
+        fixture.runtime.online = Some(1);
+        assert_eq!(
+            run_transaction(
+                &fixture.config,
+                false,
+                &fixture.client,
+                &mut fixture.runtime
+            )
+            .unwrap()["status"],
+            "waiting_for_players"
+        );
+        assert!(fixture.runtime.actions.is_empty());
     }
 }
