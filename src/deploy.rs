@@ -99,6 +99,17 @@ fn collect_configs(
             if !meta.is_file() || !config_extension(&path) {
                 bail!("Unsupported configuration file");
             }
+            match path.extension().and_then(|s| s.to_str()) {
+                Some("yml" | "yaml") => {
+                    let _: serde_yaml::Value = serde_yaml::from_slice(&fs::read(&path)?)
+                        .context("Invalid YAML configuration")?;
+                }
+                Some("json") => {
+                    let _: Value = serde_json::from_slice(&fs::read(&path)?)
+                        .context("Invalid JSON configuration")?;
+                }
+                _ => {}
+            }
             let relative = path
                 .strip_prefix(base)?
                 .to_str()
@@ -120,9 +131,10 @@ fn service(action: &str, name: &str) -> Result<Output> {
     {
         bail!("Invalid service name");
     }
-    let output = Command::new("sudo")
-        .args(["-n", "/usr/bin/systemctl", action, name])
-        .output()?;
+    let output = gitrepo::run_bounded(
+        Command::new("sudo").args(["-n", "/usr/bin/systemctl", action, name]),
+        Duration::from_secs(180),
+    )?;
     if action != "is-active" && !output.status.success() {
         bail!("systemctl {action} failed");
     }
@@ -409,7 +421,7 @@ fn run_transaction(
         for relative in &owned {
             let dest = safe_path(&server, relative)?;
             if relative == "server.properties" {
-                write_properties(sources.get(relative).map(PathBuf::as_path), &dest, &client)?;
+                write_properties(sources.get(relative).map(PathBuf::as_path), &dest, client)?;
             } else if relative == "eula.txt" && !bootstrap {
                 continue;
             } else if relative == "eula.txt" && bootstrap {
@@ -854,6 +866,96 @@ mod integration_tests {
         )
         .unwrap();
         assert_eq!(state["commit"], "previous");
+    }
+    #[test]
+    fn malformed_yaml_never_stops_service() {
+        let mut fixture = Fixture::new();
+        fs::write(
+            fixture.runtime.repo.join("server-settings/spigot.yml"),
+            "broken: [\n",
+        )
+        .unwrap();
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(&fixture.runtime.repo)
+                .args(["add", "."])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(&fixture.runtime.repo)
+                .args([
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.org",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "invalid fixture"
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            run_transaction(
+                &fixture.config,
+                false,
+                &fixture.client,
+                &mut fixture.runtime
+            )
+            .is_err()
+        );
+        assert!(fixture.runtime.actions.is_empty());
+    }
+    #[test]
+    fn missing_properties_template_still_writes_local_rcon_overlay() {
+        let mut fixture = Fixture::new();
+        fs::remove_file(
+            fixture
+                .runtime
+                .repo
+                .join("server-settings/server.properties"),
+        )
+        .unwrap();
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(&fixture.runtime.repo)
+                .args([
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.org",
+                    "commit",
+                    "--quiet",
+                    "-am",
+                    "remove properties fixture"
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+        run_transaction(
+            &fixture.config,
+            false,
+            &fixture.client,
+            &mut fixture.runtime,
+        )
+        .unwrap();
+        let properties = paths(&fixture.config, "server")
+            .unwrap()
+            .join("server.properties");
+        assert!(
+            fs::read_to_string(properties)
+                .unwrap()
+                .contains("rcon.password=local-secret")
+        );
     }
     #[test]
     fn unavailable_rcon_never_stops_service() {
