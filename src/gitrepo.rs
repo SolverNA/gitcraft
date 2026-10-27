@@ -51,8 +51,33 @@ pub(crate) fn run_bounded(command: &mut Command, timeout: Duration) -> Result<Ou
         stderr: Vec::new(),
     })
 }
+fn ssh_command(config: Option<&str>) -> Result<String> {
+    let extra = if let Some(path) = config {
+        if !path.starts_with('/')
+            || path.contains("..")
+            || !path
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b"/._-".contains(&c))
+        {
+            bail!("SSH configuration path must be absolute with no shell metacharacters");
+        }
+        format!(" -F {path}")
+    } else {
+        String::new()
+    };
+    Ok(format!(
+        "ssh{extra} -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=2"
+    ))
+}
 fn git(args: &[&str]) -> Result<String> {
-    let output = run_bounded(Command::new("git").args(args).env("GIT_TERMINAL_PROMPT", "0").env("GIT_SSH_COMMAND","ssh -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=2"),Duration::from_secs(180))?;
+    let config = std::env::var("GITCRAFT_SSH_CONFIG").ok();
+    let output = run_bounded(
+        Command::new("git")
+            .args(args)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_SSH_COMMAND", ssh_command(config.as_deref())?),
+        Duration::from_secs(180),
+    )?;
     if !output.status.success() {
         bail!("Git operation failed (credentials and remote output omitted)");
     }
@@ -136,5 +161,20 @@ mod tests {
         .unwrap();
         assert!(result.status.success());
         assert_eq!(result.stdout.len(), 1024 * 1024);
+    }
+}
+
+#[cfg(test)]
+mod ssh_tests {
+    use super::*;
+    #[test]
+    fn configured_identity_route_cannot_inject_shell() {
+        assert!(
+            ssh_command(Some("/etc/gitcraft/ssh.conf"))
+                .unwrap()
+                .contains(" -F /etc/gitcraft/ssh.conf ")
+        );
+        assert!(ssh_command(Some("/tmp/a;curl attacker")).is_err());
+        assert!(ssh_command(Some("relative.conf")).is_err());
     }
 }
