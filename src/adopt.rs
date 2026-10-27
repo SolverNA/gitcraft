@@ -1,16 +1,9 @@
 //! Adopt an existing unit without rewriting its launch command, user, Java or credentials.
 use crate::{artifacts, deploy, gitrepo, recovery};
 use anyhow::{Context, Result, bail};
-use fs2::FileExt;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::{
-    collections::BTreeMap,
-    fs::{self, OpenOptions},
-    path::Path,
-    process::Command,
-    time::Duration,
-};
+use std::{collections::BTreeMap, fs, path::Path, process::Command, time::Duration};
 fn show_unit(config: &Value) -> Result<Value> {
     let name = config["deployment"]["service"]
         .as_str()
@@ -64,6 +57,46 @@ fn stable_unit(unit: &Value) -> Value {
     }
     unit
 }
+fn launch_engine(server: &Path, unit: &Value) -> Result<String> {
+    let exec = unit["ExecStart"].as_str().context("ExecStart required")?;
+    let executable = exec
+        .split("path=")
+        .nth(1)
+        .and_then(|s| s.split(" ;").next())
+        .context("Cannot resolve executable from systemd")?;
+    if Path::new(executable).file_name().and_then(|s| s.to_str()) != Some("java") {
+        bail!(
+            "Unsupported launcher: adoption currently requires direct java -jar; shell scripts and Forge @args need a reviewed launcher adapter"
+        );
+    }
+    let args = exec
+        .split("argv[]=")
+        .nth(1)
+        .and_then(|s| s.split(" ;").next())
+        .context("Cannot resolve launch arguments")?;
+    let words: Vec<_> = args.split_whitespace().collect();
+    let jar=words.windows(2).find(|w|w[0]=="-jar").map(|w|w[1]).context("Unsupported launcher: direct -jar is required; @args and shell launchers are not inferred")?;
+    let jar_path = Path::new(jar);
+    let full = if jar_path.is_absolute() {
+        jar_path.to_path_buf()
+    } else {
+        server.join(jar_path)
+    };
+    let canonical = fs::canonicalize(&full).context("Launched JAR does not exist")?;
+    let server = fs::canonicalize(server)?;
+    let relative = canonical
+        .strip_prefix(&server)
+        .context("Launched JAR is outside server directory")?;
+    if relative.components().count() != 1 {
+        bail!("Launched engine must be a top-level pinned JAR");
+    }
+    let relative = relative.to_str().context("Non-UTF8 launched JAR")?;
+    deploy::safe_path(&server, relative)?;
+    if fs::symlink_metadata(&full)?.file_type().is_symlink() {
+        bail!("Launched engine symlink is unsupported");
+    }
+    Ok(relative.into())
+}
 fn build_plan(config: &Value, server: &Path, unit: &Value) -> Result<Value> {
     deploy::safe_path(server, "server.properties")?;
     let configured = Path::new(
@@ -89,8 +122,15 @@ fn build_plan(config: &Value, server: &Path, unit: &Value) -> Result<Value> {
         .nth(1)
         .and_then(|s| s.split(" ;").next())
         .unwrap_or("unresolved");
+    let launch = launch_engine(server, unit);
+    let (supported, engine, reason) = match launch {
+        Ok(engine) => (true, Some(engine), None),
+        Err(error) => (false, None, Some(error.to_string())),
+    };
+    let mut display = stable.clone();
+    display["ExecStart"] = json!("[redacted: exact effective command is fingerprinted]");
     Ok(
-        json!({"kind":"adopt-plan-v1","server":server,"service":config["deployment"]["service"],"unit":stable,"unit_sha256":fingerprint(&stable)?,"discovered_executable":executable,"active_state":unit["ActiveState"],"actions":["verify approved repository commit and runtime hashes","verify existing RCON credentials without resetting","seed initial managed ownership and verified local artifact receipts"],"preserves":["existing systemd unit","launch command and Java","worlds and plugin databases","existing RCON credentials"],"requires_review":true}),
+        json!({"kind":"adopt-plan-v1","server":server,"service":config["deployment"]["service"],"unit":display,"unit_sha256":fingerprint(&stable)?,"exec_start_sha256":format!("{:x}",Sha256::digest(exec.as_bytes())),"discovered_executable":executable,"launch_supported":supported,"engine_filename":engine,"unsupported_reason":reason,"active_state":unit["ActiveState"],"actions":["verify approved repository commit and runtime hashes","verify existing RCON credentials without resetting","seed initial managed ownership and verified local artifact receipts"],"preserves":["existing systemd unit","launch command and Java","worlds and plugin databases","existing RCON credentials"],"requires_review":true}),
     )
 }
 pub fn plan(config: &Value, server: &Path) -> Result<Value> {
@@ -175,9 +215,10 @@ fn apply_verified(
     if state.join("deployment.json").exists() || recovery::pending(config)?.is_some() {
         bail!("Server already managed or recovery pending");
     }
+    let launched_engine = launch_engine(server, unit)?;
     let manifest = artifacts::load_manifest(repo)?;
-    if !manifest.iter().any(|a| !a.destination.contains('/')) {
-        bail!("Adoption requires explicit engine pin");
+    if !manifest.iter().any(|a| a.destination == launched_engine) {
+        bail!("Adoption engine pin must match the existing unit direct -jar target");
     }
     let mut sources = BTreeMap::new();
     for (folder, prefix, top) in [
@@ -239,12 +280,10 @@ pub fn apply(config: &Value, plan: &Value, repo: &Path, expected_commit: &str) -
     crate::policy::validate_repository(repo)?;
     let state = Path::new(config["paths"]["state"].as_str().unwrap());
     fs::create_dir_all(state)?;
-    let lock = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(deploy::safe_path(state, "deploy.lock")?)?;
-    lock.try_lock_exclusive()?;
+    let _lock = deploy::lock_state(&config)?;
+    if crate::transfer::has_pending(&config)? {
+        bail!("Pending transfer recovery blocks adoption");
+    }
     let (approved, staged) = gitrepo::snapshot(
         config["repository"]["url"].as_str().unwrap(),
         config["repository"]["branch"].as_str().unwrap(),
@@ -299,6 +338,25 @@ mod tests {
         let config = json!({"paths":{"server":server,"state":state,"cache":root.path().join("cache")},"deployment":{"service":"custom.service"}});
         let unit = json!({"Id":"custom.service","User":"custom","Group":"custom","WorkingDirectory":server,"ExecStart":"{ path=/custom/java ; argv[]=/custom/java -Xmx7G -jar custom-paper.jar ; }","FragmentPath":fragment,"ActiveState":"active","MainPID":"123"});
         let plan = build_plan(&config, &server, &unit).unwrap();
+        assert!(plan["launch_supported"].as_bool().unwrap());
+        assert!(!serde_json::to_string(&plan).unwrap().contains("-Xmx7G"));
+        let mut unsupported = unit.clone();
+        unsupported["ExecStart"] =
+            json!("{ path=/bin/sh ; argv[]=/bin/sh launch.sh --password=hidden ; }");
+        let preview = build_plan(&config, &server, &unsupported).unwrap();
+        assert_eq!(preview["launch_supported"], false);
+        assert!(!serde_json::to_string(&preview).unwrap().contains("hidden"));
+        assert!(
+            apply_verified(
+                &config,
+                &preview,
+                &repo,
+                "approved-commit",
+                &unsupported,
+                || Ok(3)
+            )
+            .is_err()
+        );
         fs::write(&fragment, "changed unit").unwrap();
         assert!(apply_verified(&config, &plan, &repo, "approved-commit", &unit, || Ok(3)).is_err());
         fs::write(&fragment, contents).unwrap();
