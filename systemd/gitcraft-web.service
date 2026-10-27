@@ -1,0 +1,22 @@
+[Unit]
+Description=GitCraft localhost configuration UI
+After=network.target
+
+[Service]
+Type=simple
+User=minecraft
+Group=minecraft
+Environment=PATH=/usr/bin:/bin
+EnvironmentFile=/etc/gitcraft/secrets.env
+ExecStart=/opt/gitcraft/bin/gitcraft web --config /etc/gitcraft/config/agent.yml
+Restart=on-failure
+RestartSec=5
+UMask=0027
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/etc/gitcraft/config /var/lib/minecraft
+# Background deployments use the same narrowly scoped sudoers rule as the agent.
+
+[Install]
+WantedBy=multi-user.target

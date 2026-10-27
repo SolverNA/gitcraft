@@ -1,0 +1,61 @@
+name: Propose stable dependency updates
+on:
+  schedule:
+    - cron: '23 4 * * *'
+  workflow_dispatch:
+permissions:
+  contents: write
+  pull-requests: write
+concurrency:
+  group: gitcraft-dependency-updates
+  cancel-in-progress: false
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: config
+          persist-credentials: false
+      - name: Require pinned tool source
+        env:
+          TOOL_REPOSITORY: ${{ vars.GITCRAFT_TOOL_REPOSITORY }}
+          TOOL_REF: ${{ vars.GITCRAFT_TOOL_REF }}
+        run: |
+          [[ "$TOOL_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
+          [[ "$TOOL_REF" =~ ^[a-fA-F0-9]{40}$ ]]
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ vars.GITCRAFT_TOOL_REPOSITORY }}
+          ref: ${{ vars.GITCRAFT_TOOL_REF }}
+          path: tool
+          persist-credentials: false
+      - name: Resolve and validate proposed dependencies
+        run: |
+          cargo run --locked --manifest-path tool/Cargo.toml -- update-dependencies --repository "$GITHUB_WORKSPACE/config" > "$RUNNER_TEMP/gitcraft-updates.json"
+          cargo run --locked --manifest-path tool/Cargo.toml -- validate --repository "$GITHUB_WORKSPACE/config"
+      - name: Open reviewable pull request
+        working-directory: config
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if git diff --quiet -- requirements; then exit 0; fi
+          if [[ "$(gh pr list --repo "$GH_REPO" --state open --search 'in:title GitCraft dependency updates' --json number --jq 'length')" != 0 ]]; then
+            echo 'An update PR is awaiting review; keeping it unchanged.'
+            exit 0
+          fi
+          branch="gitcraft/dependency-updates-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          git checkout -b "$branch"
+          git config user.name 'gitcraft-bot'
+          git config user.email 'gitcraft-bot@users.noreply.github.com'
+          git add -- requirements/engine.json requirements/plugins.json requirements/mods.json 2>/dev/null || git add -- requirements/
+          git commit -m 'chore: propose stable compatible dependency updates'
+          git -c credential.helper='!gh auth git-credential' push origin "HEAD:refs/heads/$branch"
+          {
+            printf '%s\n\n' 'Stable releases matching the configured Minecraft version and loader. Review compatibility and backups before merging.'
+            printf '%s\n' '```json'
+            cat "$RUNNER_TEMP/gitcraft-updates.json"
+            printf '\n%s\n' '```'
+          } > "$RUNNER_TEMP/gitcraft-pr.md"
+          gh pr create --repo "$GH_REPO" --head "$branch" --title 'GitCraft dependency updates' --body-file "$RUNNER_TEMP/gitcraft-pr.md"

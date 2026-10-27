@@ -1,0 +1,32 @@
+name: Validate Minecraft configuration
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: config
+          persist-credentials: false
+      - name: Require pinned tool source
+        env:
+          TOOL_REPOSITORY: ${{ vars.GITCRAFT_TOOL_REPOSITORY }}
+          TOOL_REF: ${{ vars.GITCRAFT_TOOL_REF }}
+        run: |
+          [[ "$TOOL_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
+          [[ "$TOOL_REF" =~ ^[a-fA-F0-9]{40}$ ]]
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ vars.GITCRAFT_TOOL_REPOSITORY }}
+          ref: ${{ vars.GITCRAFT_TOOL_REF }}
+          path: tool
+          persist-credentials: false
+      - name: Reject binary artifacts and validate configuration
+        run: |
+          test -z "$(git -C config ls-files '*.jar' '*.log' 'world/*' 'world_nether/*' 'world_the_end/*' 'secrets.env' '.env')"
+          cargo run --locked --manifest-path tool/Cargo.toml -- validate --repository "$GITHUB_WORKSPACE/config"

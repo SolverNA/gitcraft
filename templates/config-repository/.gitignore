@@ -1,0 +1,13 @@
+*.jar
+*.log
+world*/
+logs/
+backups/
+cache/
+secrets.env
+.env
+eula.txt
+usercache.json
+ops.json
+whitelist.json
+banned-*.json
