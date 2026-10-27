@@ -17,7 +17,7 @@ from .config import load_config, save_config
 def read_status(config):
     state = Path(config["paths"]["state"])
     result = {"service": config["deployment"]["service"]}
-    for name in ("status.json", "installed.json"):
+    for name in ("status.json", "deployment.json"):
         path = state / name
         if path.is_file():
             try:
@@ -128,6 +128,7 @@ def make_handler(config_path):
                 return self.send(200, '<a href="/">Войти</a>', "gitcraft_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0")
             if not action_lock.acquire(blocking=False):
                 return self.send(409, "Another operation is running")
+            release_action = True
             try:
                 config = load_config(config_path)
                 if self.path == "/settings":
@@ -141,13 +142,22 @@ def make_handler(config_path):
                     return self.send(200, '<p>Сохранено.</p><a href="/">Вернуться</a>')
                 if self.path == "/deploy":
                     from .deploy import run
-                    result = run(config)
-                    return self.send(200, '<pre>' + html.escape(json.dumps(result, ensure_ascii=False, indent=2)) + '</pre><a href="/">Вернуться</a>')
+                    def deploy_background():
+                        try:
+                            run(config)
+                        except Exception:
+                            pass  # Deployment records sanitized error state itself.
+                        finally:
+                            action_lock.release()
+                    threading.Thread(target=deploy_background, daemon=True).start()
+                    release_action = False
+                    return self.send(202, '<p>Проверка запущена. Результат появится в состоянии.</p><a href="/">Вернуться</a>')
                 self.send(404, "Not found")
             except Exception:
                 self.send(400, "Operation failed. Check configuration and service journal.")
             finally:
-                action_lock.release()
+                if release_action:
+                    action_lock.release()
 
     return Handler
 
