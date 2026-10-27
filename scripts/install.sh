@@ -71,8 +71,8 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get install -y --no-install-recommends git openssh-client sudo ca-certificates openssl
 java_major=0
-if command -v java >/dev/null; then
-  java_version=$(java -version 2>&1 | head -n 1)
+if [[ -x /usr/bin/java ]]; then
+  java_version=$(/usr/bin/java -version 2>&1 | head -n 1)
   if [[ "$java_version" =~ \"([0-9]+) ]]; then java_major=${BASH_REMATCH[1]}; fi
 fi
 if ((java_major < 21)); then
