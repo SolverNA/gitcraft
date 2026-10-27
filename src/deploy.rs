@@ -238,7 +238,14 @@ fn run_inner(config: &Value, bootstrap: bool) -> Result<Value> {
     let server = paths(config, "server")?;
     let state_dir = paths(config, "state")?;
     let backup_root = paths(config, "backups")?;
-    for key in ["server", "state", "cache", "staging", "backups"] {
+    for key in [
+        "server",
+        "state",
+        "cache",
+        "staging",
+        "backups",
+        "repository",
+    ] {
         let path = paths(config, key)?;
         safe_path(&path, ".path-check")?;
         fs::create_dir_all(path)?;
@@ -359,6 +366,8 @@ fn run_inner(config: &Value, bootstrap: bool) -> Result<Value> {
             let dest = safe_path(&server, relative)?;
             if relative == "server.properties" {
                 write_properties(sources.get(relative).map(PathBuf::as_path), &dest, &client)?;
+            } else if relative == "eula.txt" && !bootstrap {
+                continue;
             } else if relative == "eula.txt" && bootstrap {
                 fs::write(&dest, "eula=true\n")?;
             } else if let Some(source) = sources.get(relative) {
@@ -399,7 +408,7 @@ fn run_inner(config: &Value, bootstrap: bool) -> Result<Value> {
     }
     let mut managed: BTreeSet<String> = sources.keys().cloned().collect();
     managed.insert("server.properties".into());
-    if bootstrap {
+    if bootstrap || owned.contains("eula.txt") {
         managed.insert("eula.txt".into());
     }
     let versions: BTreeMap<_, _> = manifest.iter().map(|a| (&a.name, &a.version)).collect();

@@ -35,6 +35,13 @@ fn text<'a>(v: &'a Value, key: &str) -> Result<&'a str> {
 }
 pub fn load_manifest(repo: &Path) -> Result<Vec<Artifact>> {
     let mut result = Vec::new();
+    if repo
+        .join("requirements")
+        .symlink_metadata()
+        .is_ok_and(|m| m.file_type().is_symlink())
+    {
+        bail!("Manifest directory symlink forbidden");
+    }
     for category in ["engine", "plugins", "mods"] {
         let path = repo.join("requirements").join(format!("{category}.json"));
         if !path.exists() {
@@ -112,6 +119,9 @@ pub fn sha256(path: &Path) -> Result<String> {
     Ok(format!("{:x}", digest.finalize()))
 }
 pub fn download(artifact: &Artifact, cache: &Path) -> Result<PathBuf> {
+    if artifact.sha256.len() != 64 || !artifact.sha256.bytes().all(|c| c.is_ascii_hexdigit()) {
+        bail!("Invalid artifact digest");
+    }
     fs::create_dir_all(cache)?;
     let target = cache.join(format!("{}.jar", artifact.sha256));
     if target.exists()
