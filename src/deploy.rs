@@ -574,6 +574,17 @@ pub(crate) fn lock_state(config: &Value) -> Result<DeploymentLock> {
     Ok(DeploymentLock { file })
 }
 fn execute(config: &Value, bootstrap: bool) -> Result<Value> {
+    execute_with(
+        config,
+        |validated| run_inner(validated, bootstrap),
+        ensure_stopped,
+    )
+}
+fn execute_with(
+    config: &Value,
+    run: impl FnOnce(&Value) -> Result<Value>,
+    stopped: impl Fn(&Value) -> Result<()>,
+) -> Result<Value> {
     let config = crate::config::validate(config.clone())?;
     let config = &config;
     let state = paths(config, "state")?;
@@ -585,10 +596,10 @@ fn execute(config: &Value, bootstrap: bool) -> Result<Value> {
             );
         }
         if let Some(journal) = crate::recovery::pending(config)? {
-            ensure_stopped(config)?;
+            stopped(config)?;
             crate::recovery::restore_stopped(config, &journal, false)
         } else {
-            run_inner(config, bootstrap)
+            run(config)
         }
     })();
     match &result {
@@ -1196,5 +1207,109 @@ mod integration_tests {
             "waiting_for_players"
         );
         assert!(fixture.runtime.actions.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod execute_tests {
+    use super::*;
+    fn fixture() -> (tempfile::TempDir, Value) {
+        let root = tempfile::tempdir().unwrap();
+        let path_values: serde_json::Map<_, _> = [
+            "server",
+            "state",
+            "cache",
+            "backups",
+            "staging",
+            "repository",
+        ]
+        .into_iter()
+        .map(|key| (key.into(), json!(root.path().join(key))))
+        .collect();
+        let config = crate::config::validate(
+            json!({"paths":path_values,"repository":{"url":"https://example.org/config.git"}}),
+        )
+        .unwrap();
+        for key in ["server", "state"] {
+            fs::create_dir_all(Path::new(config["paths"][key].as_str().unwrap())).unwrap();
+        }
+        let server = paths(&config, "server").unwrap();
+        fs::create_dir_all(server.join("world")).unwrap();
+        fs::write(server.join("world/level.dat"), "original").unwrap();
+        (root, config)
+    }
+    #[test]
+    fn competing_execute_lock_prevents_all_external_operations() {
+        let (_root, config) = fixture();
+        let _lock = lock_state(&config).unwrap();
+        assert!(
+            execute_with(
+                &config,
+                |_| panic!("deployment must not run"),
+                |_| panic!("service must not be queried")
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn pending_transfer_blocks_execute_and_persists_actionable_status() {
+        let (_root, config) = fixture();
+        let manifest = crate::transfer::Manifest {
+            files: vec![crate::transfer::TransferFile {
+                kind: "world".into(),
+                path: "world/level.dat".into(),
+                size: 1,
+                sha256: "0".repeat(64),
+            }],
+            source_consistency: "stopped".into(),
+        };
+        let session = crate::transfer::create(&config, manifest).unwrap();
+        let path = paths(&config, "state")
+            .unwrap()
+            .join("transfers")
+            .join(session["id"].as_str().unwrap());
+        fs::write(path.join("journal.json"), "{\"phase\":\"prepared\"}").unwrap();
+        assert!(
+            execute_with(
+                &config,
+                |_| panic!("deployment must not run"),
+                |_| panic!("service must not be queried")
+            )
+            .is_err()
+        );
+        let status: Value = serde_json::from_slice(
+            &fs::read(paths(&config, "state").unwrap().join("status.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(status["status"], "recovery_required");
+        assert_eq!(
+            fs::read_to_string(paths(&config, "server").unwrap().join("world/level.dat")).unwrap(),
+            "original"
+        );
+    }
+    #[test]
+    fn startup_recovery_checks_stopped_before_restoration_and_never_restarts() {
+        let (_root, config) = fixture();
+        let journal =
+            json!({"server":config["paths"]["server"],"phase":"prepared","may_have_started":false});
+        crate::recovery::save(&config, &journal).unwrap();
+        assert!(
+            execute_with(
+                &config,
+                |_| panic!("new deployment forbidden"),
+                |_| anyhow::bail!("active service")
+            )
+            .is_err()
+        );
+        assert!(crate::recovery::pending(&config).unwrap().is_some());
+        let result =
+            execute_with(&config, |_| panic!("new deployment forbidden"), |_| Ok(())).unwrap();
+        assert_eq!(result["status"], "recovered_stopped");
+        assert_eq!(result["service_restarted"], false);
+        assert!(crate::recovery::pending(&config).unwrap().is_none());
+        assert_eq!(
+            fs::read_to_string(paths(&config, "server").unwrap().join("world/level.dat")).unwrap(),
+            "original"
+        );
     }
 }
