@@ -1,11 +1,10 @@
 //! Durable managed-file rollback journal. Worlds and plugin databases are deliberately outside rollback.
 use crate::{artifacts, deploy};
 use anyhow::{Context, Result, bail};
-use fs2::FileExt;
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -86,6 +85,21 @@ pub(crate) fn restore_stopped(
         );
     }
     let phase = journal["phase"].as_str().context("Missing journal phase")?;
+    if ![
+        "prepared",
+        "stopped",
+        "backed_up",
+        "applying",
+        "starting",
+        "healthy",
+        "committed",
+        "rolling_back",
+        "recovery_required",
+    ]
+    .contains(&phase)
+    {
+        bail!("Unknown recovery phase; refusing to discard journal");
+    }
     let mutation_possible = matches!(
         phase,
         "applying" | "starting" | "healthy" | "committed" | "rolling_back" | "recovery_required"
@@ -107,6 +121,16 @@ pub(crate) fn restore_stopped(
         let hashes: BTreeMap<String, String> =
             serde_json::from_value(journal["backup_hashes"].clone())?;
         // Validate every backup before changing any target, including corruption from a partial disk write.
+        for relative in &owned {
+            deploy::validate_owned(relative)?;
+            deploy::safe_path(server, relative)?;
+        }
+        for relative in hashes.keys() {
+            deploy::validate_owned(relative)?;
+            if !owned.contains(relative) {
+                bail!("Backup hash path is not owned");
+            }
+        }
         for (relative, expected) in &hashes {
             let source = deploy::safe_path(backup, relative)?;
             if artifacts::sha256(&source)? != *expected {
@@ -115,7 +139,7 @@ pub(crate) fn restore_stopped(
         }
         for relative in &owned {
             let destination = deploy::safe_path(server, relative)?;
-            if let Some(_) = hashes.get(relative) {
+            if hashes.contains_key(relative) {
                 copy_durable(&deploy::safe_path(backup, relative)?, &destination)?;
             } else if destination.exists() {
                 if !destination.is_file() {
@@ -149,12 +173,10 @@ pub fn recover(config: &Value, acknowledge_data_risk: bool) -> Result<Value> {
     let config = crate::config::validate(config.clone())?;
     let state = Path::new(config["paths"]["state"].as_str().unwrap());
     fs::create_dir_all(state)?;
-    let lock = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(deploy::safe_path(state, "deploy.lock")?)?;
-    lock.try_lock_exclusive()?;
+    let _lock = deploy::lock_state(&config)?;
+    if crate::transfer::has_pending(&config)? {
+        bail!("Recover pending world transfer before managed-file recovery");
+    }
     deploy::ensure_stopped(&config)?;
     let journal = pending(&config)?.context("No interrupted deployment journal")?;
     restore_stopped(&config, &journal, acknowledge_data_risk)
@@ -195,12 +217,10 @@ pub fn backup_data(config: &Value, includes: &[String]) -> Result<Value> {
     }
     let state = Path::new(config["paths"]["state"].as_str().unwrap());
     fs::create_dir_all(state)?;
-    let lock = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(deploy::safe_path(state, "deploy.lock")?)?;
-    lock.try_lock_exclusive()?;
+    let _lock = deploy::lock_state(&config)?;
+    if crate::transfer::has_pending(&config)? {
+        bail!("Pending transfer recovery blocks data backup");
+    }
     deploy::ensure_stopped(&config)?;
     backup_data_stopped(&config, includes, || deploy::ensure_stopped(&config))
 }

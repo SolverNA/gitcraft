@@ -67,6 +67,30 @@ pub fn safe_path(root: &Path, relative: &str) -> Result<PathBuf> {
     }
     Ok(candidate)
 }
+pub(crate) fn validate_owned(relative: &str) -> Result<()> {
+    crate::policy::relative(relative)?;
+    let path = Path::new(relative);
+    let parts: Vec<_> = path.components().collect();
+    if parts.len() > 1
+        && !relative.starts_with("plugins/")
+        && !relative.starts_with("mods/")
+        && !relative.starts_with("config/")
+        && !relative.starts_with("defaultconfigs/")
+    {
+        bail!("Invalid managed ownership prefix");
+    }
+    let jar = relative.ends_with(".jar");
+    if jar
+        && parts.len() > 1
+        && (!relative.starts_with("plugins/") && !relative.starts_with("mods/") || parts.len() != 2)
+    {
+        bail!("Invalid managed JAR path");
+    }
+    if !jar && !config_extension(path) {
+        bail!("Invalid managed ownership extension");
+    }
+    Ok(())
+}
 fn config_extension(path: &Path) -> bool {
     path.extension().and_then(|s| s.to_str()).is_some_and(|s| {
         [
@@ -397,19 +421,7 @@ fn run_transaction(
         owned.insert("eula.txt".into());
     }
     for relative in &owned {
-        let parts: Vec<_> = Path::new(relative).components().collect();
-        if parts.len() > 1
-            && !relative.starts_with("plugins/")
-            && !relative.starts_with("mods/")
-            && !relative.starts_with("config/")
-            && !relative.starts_with("defaultconfigs/")
-        {
-            bail!("Invalid ownership state");
-        }
-        if parts.len() == 1 && !relative.ends_with(".jar") && !config_extension(Path::new(relative))
-        {
-            bail!("Invalid ownership extension");
-        }
+        validate_owned(relative)?;
         let dest = safe_path(&server, relative)?;
         if dest.exists() && !dest.is_file() {
             bail!("Managed destination is not a regular file");
@@ -426,6 +438,7 @@ fn run_transaction(
     // Journal is durable before stop or any managed mutation; recovery never touches worlds.
     let backup = backup_root.join(format!("{commit}-{}", timestamp()));
     fs::create_dir_all(&backup)?;
+    File::open(&backup_root)?.sync_all()?;
     let mut journal = json!({"phase":"prepared","server":server,"backup":backup,"commit":commit,"owned":owned,"previous_state":if state_file.exists(){state.clone()}else{Value::Null},"backup_hashes":{},"may_have_started":false,"bootstrap":bootstrap});
     crate::recovery::save(config, &journal)?;
     runtime.checkpoint("prepared")?;
@@ -539,19 +552,37 @@ fn run_transaction(
     crate::recovery::finish(config, &journal)?;
     Ok(result)
 }
-fn execute(config: &Value, bootstrap: bool) -> Result<Value> {
-    let config = crate::config::validate(config.clone())?;
-    let config = &config;
+pub(crate) struct DeploymentLock {
+    file: File,
+}
+impl Drop for DeploymentLock {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.file);
+    }
+}
+pub(crate) fn lock_state(config: &Value) -> Result<DeploymentLock> {
     let state = paths(config, "state")?;
     safe_path(&state, "deploy.lock")?;
     fs::create_dir_all(&state)?;
-    let lock = OpenOptions::new()
+    let file = OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
         .open(state.join("deploy.lock"))?;
-    lock.try_lock_exclusive()
+    file.try_lock_exclusive()
         .context("Another deployment is running")?;
+    Ok(DeploymentLock { file })
+}
+fn execute(config: &Value, bootstrap: bool) -> Result<Value> {
+    let config = crate::config::validate(config.clone())?;
+    let config = &config;
+    let state = paths(config, "state")?;
+    let _lock = lock_state(config)?;
+    if crate::transfer::has_pending(config)? {
+        bail!(
+            "Pending world-transfer recovery blocks deployment; explicitly recover the transfer while Minecraft is stopped"
+        );
+    }
     let result = if let Some(journal) = crate::recovery::pending(config)? {
         ensure_stopped(config)?;
         crate::recovery::restore_stopped(config, &journal, false)
@@ -572,7 +603,6 @@ fn execute(config: &Value, bootstrap: bool) -> Result<Value> {
             )?;
         }
     }
-    FileExt::unlock(&lock)?;
     result
 }
 pub fn run(config: &Value) -> Result<Value> {
