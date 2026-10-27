@@ -1,20 +1,25 @@
 [Unit]
-Description=GitCraft deployment agent (one reconciliation)
+Description=GitCraft deployment agent (configuration-driven polling)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=oneshot
+Type=simple
 User=minecraft
 Group=minecraft
 Environment=PATH=/usr/bin:/bin
+Environment=GITCRAFT_SSH_CONFIG=/etc/gitcraft/ssh.conf
 EnvironmentFile=/etc/gitcraft/secrets.env
-ExecStart=/opt/gitcraft/bin/gitcraft agent --config /etc/gitcraft/config/agent.yml --once
-TimeoutStartSec=30min
+ExecStart=/opt/gitcraft/bin/gitcraft agent --config /etc/gitcraft/config/agent.yml
+Restart=on-failure
+RestartSec=5
 UMask=0027
 PrivateTmp=true
 ProtectSystem=strict
-ProtectHome=true
+ProtectHome=read-only
 ReadWritePaths=/var/lib/minecraft
 # sudo is limited to three operations on minecraft.service; NoNewPrivileges would block it.
+
+[Install]
+WantedBy=multi-user.target
 

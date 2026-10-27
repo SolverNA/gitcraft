@@ -7,6 +7,7 @@ Type=simple
 User=minecraft
 Group=minecraft
 Environment=PATH=/usr/bin:/bin
+Environment=GITCRAFT_SSH_CONFIG=/etc/gitcraft/ssh.conf
 EnvironmentFile=/etc/gitcraft/secrets.env
 ExecStart=/opt/gitcraft/bin/gitcraft web --config /etc/gitcraft/config/agent.yml
 Restart=on-failure
@@ -14,7 +15,7 @@ RestartSec=5
 UMask=0027
 PrivateTmp=true
 ProtectSystem=strict
-ProtectHome=true
+ProtectHome=read-only
 ReadWritePaths=/etc/gitcraft/config /var/lib/minecraft
 # Background deployments use the same narrowly scoped sudoers rule as the agent.
 

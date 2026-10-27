@@ -16,6 +16,11 @@ test ! -e "$temporary/sentinel"
 printf '%s\n' 'ID=ubuntu' 'VERSION_ID="24.04"' > "$temporary/os-release"
 "$script_dir/install.sh" --repository git@github.com:team/config.git --dry-run --os-release "$temporary/os-release" > "$temporary/plan"
 grep -Fq 'Distribution: ubuntu 24.04' "$temporary/plan"
+"$script_dir/install.sh" --repository git@github.com:team/config.git --mode adopt --service paper.service --server-path /srv/paper --dry-run --os-release "$temporary/os-release" > "$temporary/adopt-plan"
+grep -Fq 'preserve existing Java/ExecStart/RCON credentials' "$temporary/adopt-plan"
+grep -Fq 'no Minecraft stop/start' "$temporary/adopt-plan"
+if "$script_dir/install.sh" --repository git@github.com:team/config.git --mode broken --dry-run --os-release "$temporary/os-release" >/dev/null 2>&1; then exit 1; fi
+if "$script_dir/install.sh" --repository git@github.com:team/config.git --service '--bad.service' --dry-run --os-release "$temporary/os-release" >/dev/null 2>&1; then exit 1; fi
 printf '%s\n' 'ID=arch' > "$temporary/os-release"
 if "$script_dir/install.sh" --repository git@github.com:team/config.git --dry-run --os-release "$temporary/os-release" >/dev/null 2>&1; then exit 1; fi
 if "$script_dir/install.sh" --repository https://secret@github.com/team/config.git --dry-run >/dev/null 2>&1; then exit 1; fi
