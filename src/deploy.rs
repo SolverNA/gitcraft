@@ -578,21 +578,25 @@ fn execute(config: &Value, bootstrap: bool) -> Result<Value> {
     let config = &config;
     let state = paths(config, "state")?;
     let _lock = lock_state(config)?;
-    if crate::transfer::has_pending(config)? {
-        bail!(
-            "Pending world-transfer recovery blocks deployment; explicitly recover the transfer while Minecraft is stopped"
-        );
-    }
-    let result = if let Some(journal) = crate::recovery::pending(config)? {
-        ensure_stopped(config)?;
-        crate::recovery::restore_stopped(config, &journal, false)
-    } else {
-        run_inner(config, bootstrap)
-    };
+    let result = (|| -> Result<Value> {
+        if crate::transfer::has_pending(config)? {
+            bail!(
+                "Pending world-transfer recovery blocks deployment; explicitly recover the transfer while Minecraft is stopped"
+            );
+        }
+        if let Some(journal) = crate::recovery::pending(config)? {
+            ensure_stopped(config)?;
+            crate::recovery::restore_stopped(config, &journal, false)
+        } else {
+            run_inner(config, bootstrap)
+        }
+    })();
     match &result {
         Ok(value) => atomic_json(&state.join("status.json"), value)?,
         Err(_) => {
-            let status = if crate::recovery::pending(config)?.is_some() {
+            let status = if crate::recovery::pending(config)?.is_some()
+                || crate::transfer::has_pending(config)?
+            {
                 "recovery_required"
             } else {
                 "error"
