@@ -1,127 +1,77 @@
 # GitCraft
 
-Minecraft GitOps на Rust: GitHub хранит настройки и закрепленные зависимости, сервер устанавливает одобренный коммит, когда игроков нет. Полная идея и границы системы — в [IDEA.md](IDEA.md).
+**Minecraft GitOps на Rust:** настройте сборку локально, выберите конфиги для Git, отправьте изменение через PR и разверните одобренный commit на сервере, когда игроков нет. Миры, JAR, базы плагинов и секреты остаются вне Git.
 
-В Git не хранятся миры, данные игроков, JAR, пароли и резервные копии. Репозиторий этого инструмента отделен от репозитория настроек вашего Minecraft.
+📖 **[GitHub Wiki](https://github.com/SolverNA/gitcraft/wiki)** · **[Версионируемая документация](docs/wiki/Home.md)** · [Быстрый старт](docs/wiki/Quickstart.md) · [Исходная идея](IDEA.md)
 
-## Сборка и проверка
+## Как проходит работа
 
-Нужны Rust/Cargo, Git; для рабочего сервера — Debian/Ubuntu с systemd и подходящая версия Java.
+```text
+Локальный Minecraft → export plan → review → config Git → PR → merge deploy-ветки
+                                                               ↓
+                                    VPS: staging + hashes → пустой онлайн → deploy
+
+Миры и JAR → отдельный authenticated transport → verify → явный commit на VPS
+```
+
+Один репозиторий хранит этот инструмент, другой — настройки конкретной сборки. Агент следит только за `repository.branch` и устанавливает точный SHA; ветка разработчика не становится релизом до merge. Бот зависимостей предлагает стабильные совместимые версии через PR.
+
+## Быстрый вход
 
 ```sh
 cargo build --locked --release
 cargo test --locked
-cargo fmt --check
-cargo clippy --all-targets --locked -- -D warnings
 ./target/release/gitcraft --help
 ```
 
-На сервере Python не требуется. Используется один бинарник `gitcraft` и shell-установщик. Rust toolchain требуется только при сборке из исходников.
+Нужны Rust/Cargo 1.95.0 и Git для сборки; Python на сервере не требуется. Рабочая установка поддерживает Debian/Ubuntu с systemd и подходящей для вашей сборки Java.
 
-## Установка
+1. **[Экспортировать локальную сборку](docs/wiki/Export-and-policy.md):** `export plan` с точным выбором файлов и metadata JAR, затем `export apply --reviewed` в новый каталог. План не выводит исходные значения конфигов, а применение повторно проверяет SHA. Неизвестный источник JAR задается явно как `transfer`, без выдуманных URL.
+2. **[Настроить Git и PR](docs/wiki/Pull-requests.md):** отдельный config repo, protected deploy-ветка, CI. `propose` создает feature branch и PR; прямой push в deploy-ветку не выполняется.
+3. **[Пустой VPS](docs/wiki/Transfer.md):** installer dry-run → установка → закрыть внешний RCON → прямой перенос мира/JAR → verify/commit → явный EULA bootstrap.
+4. **[Существующий VPS](docs/wiki/Adoption.md):** `install.sh --mode adopt`, read-only plan и exact-SHA apply; существующие unit, Java, User, миры и RCON credentials сохраняются.
 
-Сначала соберите и проверьте бинарник. План установки можно посмотреть без root:
+## Что входит
 
-```sh
-bash scripts/install.sh --repository git@github.com:your-team/minecraft-config.git --dry-run
-sudo bash scripts/install.sh --repository git@github.com:your-team/minecraft-config.git --binary ./target/release/gitcraft
-```
+- Общая policy для export, Git/CI, PR и deploy staging: tracked-file audit, явные approvals произвольных конфигов, world/runtime/binary exclusions и эвристика секретов.
+- Mappings `server-settings/`, `plugins-configs/`, `config/`, `defaultconfigs/`.
+- HTTPS pins с SHA-256 и отдельные transfer-backed pins с проверенными receipt.
+- Прямой resumable transport: authentication, scoped sessions, chunks, offsets, SHA, квоты, verify и явное подтверждение замены мира.
+- Loopback Web UI: статус, repository/branch onboarding, export/adopt планы, PR-предложения из рабочего clone и browser transfer; CLI и YAML остаются доступны.
+- Настраиваемый poll в долгоживущем systemd agent, RCON fail-closed и межпроцессная блокировка.
+- Durable journal, backup hashes, осознанное stopped recovery после старта новой Java; отдельные offline game-data backups.
 
-Установщик поддерживает Debian/Ubuntu с работающим systemd, сохраняет существующие конфиги, создает read-only SSH deploy key и запускает локальную панель. Зарегистрируйте публичный ключ в GitHub без write-доступа и независимо проверьте SSH host key GitHub. Автоматическое доверие через `ssh-keyscan` не применяется.
+## Руководства
 
-**До bootstrap закройте внешний доступ к TCP-порту RCON (по умолчанию 25575) для IPv4 и IPv6.** Loopback-адрес клиента RCON в agent.yml не ограничивает сетевой listener Minecraft. Установщик не меняет firewall или SSH. Доступ к Minecraft, SSH и панели настройте под свою сеть. Bootstrap и таймер не запускаются установщиком автоматически.
+| Задача | Страница |
+|---|---|
+| Понять устройство | [Архитектура](docs/wiki/Architecture.md) |
+| Все поля YAML и квоты | [Конфигурация](docs/wiki/Configuration.md) |
+| Команды и UI | [Справочник](docs/wiki/Commands-and-UI.md) |
+| Миры/JAR и обрыв загрузки | [Перенос](docs/wiki/Transfer.md) |
+| Unit уже существует | [Adopt](docs/wiki/Adoption.md) |
+| Ветки, источники и review | [PR](docs/wiki/Pull-requests.md) |
+| Секреты, сеть и права | [Безопасность](docs/wiki/Security.md) |
+| Ошибка старта/crash/backup | [Восстановление](docs/wiki/Recovery.md) |
+| Что делать при ошибке | [Диагностика](docs/wiki/Troubleshooting.md) |
 
-## Подготовка GitHub-репозитория
+Страницы опубликованы в [GitHub Wiki](https://github.com/SolverNA/gitcraft/wiki) и версионируются вместе с кодом в `docs/wiki/`. Копия в исходниках позволяет читать руководство для конкретного commit.
 
-`scripts/bootstrap-repo.sh` использует локальную авторизацию GitHub CLI (`gh auth login`) администратора. Токен не передается агенту Minecraft. Сначала проверьте план:
-
-```sh
-bash scripts/bootstrap-repo.sh --repository your-team/minecraft-config --tool-repository your-team/gitcraft --tool-ref FULL_REVIEWED_40_CHARACTER_COMMIT_SHA --create --dry-run
-```
-
-Замените `FULL_REVIEWED_40_CHARACTER_COMMIT_SHA` реальным SHA опубликованного коммита инструмента. Репозиторий инструмента должен быть публичным: шаблон Actions не передает credentials для доступа к другому приватному репозиторию. Уберите `--dry-run`, чтобы создать приватный репозиторий и отправить шаблон; для существующего репозитория уберите также `--create`, тогда изменения предлагаются через PR. В репозиторий добавляются Actions проверки и бота обновлений. Правила защиты `main`, обязательные проверки/одобрения и разрешение Actions создавать PR настройте в GitHub отдельно.
-
-## Конфигурация
-
-Все настройки можно редактировать руками. Пример локального `agent.yml`:
-
-```yaml
-repository:
-  url: git@github.com:your-team/minecraft-config.git
-  branch: main
-  poll_interval_seconds: 60
-paths:
-  repository: /var/lib/minecraft/repository
-  server: /var/lib/minecraft/server
-  state: /var/lib/minecraft/state
-  cache: /var/lib/minecraft/cache
-  staging: /var/lib/minecraft/staging
-  backups: /var/lib/minecraft/backups
-deployment:
-  service: minecraft.service
-  empty_grace_seconds: 60
-  health_timeout_seconds: 120
-rcon:
-  host: 127.0.0.1
-  port: 25575
-  password_env: MINECRAFT_RCON_PASSWORD
-  timeout_seconds: 5
-web:
-  host: 127.0.0.1
-  port: 8765
-  token_env: GITCRAFT_WEB_TOKEN
-```
-
-Каталоги должны быть абсолютными, отдельными и не вложенными друг в друга. Пароль RCON и токен панели передаются через указанные переменные окружения; не записывайте их в конфигурационный Git. Для UI нужен случайный токен длиной минимум 24 символа. Агент добавляет настройки RCON из локального секрета в рабочий `server.properties` при деплое.
-
-## Команды
+## Проверка разработки
 
 ```sh
-gitcraft validate --repository ./minecraft-config
-gitcraft update-dependencies --repository ./minecraft-config
-gitcraft agent --config /etc/gitcraft/config/agent.yml --once
-gitcraft status --config /etc/gitcraft/config/agent.yml
-gitcraft web --config /etc/gitcraft/config/agent.yml
+cargo fmt --check
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --locked
+bash scripts/test-install.sh
 ```
 
-`agent` без `--once` опрашивает репозиторий с заданным интервалом. Systemd timer использует однократный запуск. `deploy` также выполняет одну безопасную попытку и не обходит проверку игроков. Недоступность RCON прерывает применение.
+Локальный E2E использует реальные временные Git repositories, ветку/merge, экспорт, перенос файлов и hashes/receipts. Service/RCON/stopped checks подменены; это не тест реального JVM, production VPS или правил GitHub branch protection. Отдельный PR-тест использует mocked `gh` и настоящий bare remote.
 
-Для первичного запуска остановленного сервера предусмотрена отдельная команда. Перед ее выполнением прочитайте и примите Minecraft EULA; флаг означает ваше согласие:
+## Существенные границы
 
-```sh
-gitcraft bootstrap --config /etc/gitcraft/config/agent.yml --accept-eula
-```
-
-После установки используйте helper из проверенной копии инструмента: он читает локальные секреты без помещения в аргументы процесса, запускает bootstrap от пользователя Minecraft и включает таймер только после успеха.
-
-```sh
-sudo bash scripts/bootstrap-server.sh --accept-eula
-```
-
-Bootstrap запрещен после успешного развертывания. Без engine manifest развертывание запрещено. Пустой шаблон репозитория можно валидировать до выбора настоящих зависимостей.
-
-## Зависимости
-
-`requirements/engine.json` содержит один объект, `plugins.json` — `{"plugins": [...]}`, `mods.json` — `{"mods": [...]}`. Для каждого компонента нужны `name`, безопасное имя `filename` с расширением `.jar`, `pinned.version`, `pinned.url` (HTTPS), `pinned.sha256` (64 hex-символа). Для ядра имя файла — `server.jar`.
-
-Фиктивных скачиваемых JAR в шаблоне нет: добавьте настоящие версии и проверенные хеши. Поддерживается схема одного запускаемого `server.jar`; дистрибутивы Forge с отдельными библиотеками и argument-файлами пока не поддерживаются. Поддерживаются ручные pins и обновление через Modrinth с `source.provider: modrinth`, `project`, точной версией `minecraft`, `loader` и `channel: release`. Автообновление Paper/Purpur через их собственные API пока не реализовано: ядро можно закрепить вручную. Обновление выбирает стабильный совместимый релиз, проверяет размер и SHA-512 источника и записывает SHA-256. Изменения проходят через PR; автоматически сливать PR не требуется.
-
-## Web UI
-
-Панель слушает только loopback. Открывайте ее через SSH-туннель к порту 8765. Вход — локальный токен, далее HttpOnly/SameSite session cookie и CSRF-токен. UI показывает состояние, запускает проверку в фоне и редактирует только интервал опроса, период пустого сервера и таймаут готовности. Запуски защищены общей межпроцессной блокировкой.
-
-Изменение конфигов Minecraft, управление PR и отдельная ручная кнопка отката в UI пока не реализованы. Используйте GitHub и обычный PR-процесс. Панель имеет те же узкие права запуска/остановки Minecraft, что и агент; не публикуйте ее напрямую в Интернет.
-
-## Поведение и ограничения
-
-Скачивание и проверка хешей выполняются до остановки. Управляются только явно перечисленные конфиги и бинарники; ранее управляемые удаленные компоненты убираются, посторонние файлы сохраняются. При неудаче запуска агент восстанавливает предыдущие управляемые файлы и проверяет восстановленный сервер. Результат записывается в локальный state и systemd journal.
-
-Резервная копия управляемых файлов не является копией мира или баз плагинов. Миграции данных могут сделать возврат старого JAR несовместимым. Настройте отдельное резервное копирование миров и данных перед обновлениями с миграциями. Период пустого сервера не блокирует вход нового игрока в короткий промежуток между последней проверкой и остановкой.
-
-Текущая версия — MVP. Проверки с временными каталогами и подменными сервисами не заменяют пробный запуск на отдельной машине с вашей сборкой Minecraft.
-
-Java, агент и панель в текущем MVP работают под одним системным UID. Плагины считаются доверенным кодом: такой процесс может читать deployment state и секреты своего пользователя. Разделение UID и защищенный управляющий сокет — отдельное улучшение модели изоляции. Файл `/etc/gitcraft/secrets.env` остается root-owned 0600; изменяемый UI каталог настроек расположен отдельно в `/etc/gitcraft/config/`.
-
-При аварийном завершении процесса или отключении питания посреди применения автоматическое восстановление по журналу транзакции пока отсутствует. Проверьте рабочие файлы, последний успешный commit и локальную резервную копию вручную перед повторным запуском. Политика retention для резервных копий, кеша и staging пока не реализована: следите за свободным местом и удаляйте ненужные данные по своей политике, сохраняя необходимые для восстановления копии.
-
-В этой рабочей среде повторная установка именованного toolchain `1.95.0` столкнулась с локальным конфликтом rustup. Проверки успешно выполнены установленным `stable`, который здесь также имеет версию Rust/Cargo 1.95.0. При таком же локальном конфликте можно выполнить `RUSTUP_TOOLCHAIN=stable cargo test --locked` и аналогично другие Cargo-команды, предварительно проверив `RUSTUP_TOOLCHAIN=stable rustc --version`. Закрепление в `rust-toolchain.toml` предназначено для чистой установки 1.95.0; обход не означает совместимость с произвольной более старой версией.
+- До первого старта закройте внешний TCP RCON для IPv4 и IPv6. Loopback client не ограничивает Minecraft listener. Firewall/SSH установщик не меняет; Web UI открывайте через SSH tunnel.
+- Secret scanning эвристический, а не гарантия. Каждый выбранный config требует ручного review. Плагины считаются доверенным кодом: fresh MVP использует один UID для Java, агента и UI.
+- После попытки запуска новой Java автоматический downgrade запрещен: данные уже могли мигрировать. [Recovery](docs/wiki/Recovery.md) восстанавливает managed files и оставляет сервис остановленным; мир/БД требуют соответствующей отдельной копии.
+- Browser upload ограничен 64 MiB на файл; более крупные файлы отправляются streaming CLI. Источник должен быть остановлен или быть заранее согласованным snapshot.
+- Retention backup/cache/staging не автоматизирована. Поддерживается управляемый JAR launcher; установка сложных Forge libraries/argfiles не угадывается. Modrinth — поддерживаемый auto-update provider; неизвестные/прочие источники закрепляются вручную.
