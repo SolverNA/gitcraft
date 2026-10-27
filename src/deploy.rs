@@ -1,0 +1,573 @@
+use crate::{artifacts, gitrepo, rcon::RconClient};
+use anyhow::{Context, Result, bail};
+use fs2::FileExt;
+use serde_json::{Value, json};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs::{self, File, OpenOptions},
+    io::Write,
+    path::{Component, Path, PathBuf},
+    process::{Command, Output},
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+
+fn text<'a>(v: &'a Value, section: &str, key: &str) -> Result<&'a str> {
+    v[section][key]
+        .as_str()
+        .with_context(|| format!("Missing configuration {section}.{key}"))
+}
+fn seconds(v: &Value, key: &str, default: u64) -> u64 {
+    v["deployment"][key].as_u64().unwrap_or(default)
+}
+fn timestamp() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+fn atomic_json(path: &Path, value: &Value) -> Result<()> {
+    let parent = path.parent().context("State needs parent")?;
+    fs::create_dir_all(parent)?;
+    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+    serde_json::to_writer_pretty(&mut temp, value)?;
+    temp.as_file().sync_all()?;
+    temp.persist(path)?;
+    Ok(())
+}
+pub fn safe_path(root: &Path, relative: &str) -> Result<PathBuf> {
+    let mut candidate = root.to_path_buf();
+    if relative.is_empty() {
+        bail!("Empty managed path");
+    }
+    // Check all ancestors too: a symlinked server root must never redirect writes.
+    let mut ancestor = PathBuf::new();
+    for component in root.components() {
+        ancestor.push(component);
+        if ancestor
+            .symlink_metadata()
+            .is_ok_and(|m| m.file_type().is_symlink())
+        {
+            bail!("Symlink in managed root");
+        }
+    }
+    for component in Path::new(relative).components() {
+        if let Component::Normal(part) = component {
+            candidate.push(part);
+        } else {
+            bail!("Unsafe managed path");
+        }
+        if candidate
+            .symlink_metadata()
+            .is_ok_and(|m| m.file_type().is_symlink())
+        {
+            bail!("Symlink in managed destination");
+        }
+    }
+    Ok(candidate)
+}
+fn config_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|s| s.to_str())
+        .is_some_and(|s| ["yml", "yaml", "properties", "json", "txt", "toml", "conf"].contains(&s))
+}
+fn collect_configs(
+    base: &Path,
+    current: &Path,
+    prefix: &str,
+    top: bool,
+    result: &mut BTreeMap<String, PathBuf>,
+) -> Result<()> {
+    if !current.exists() {
+        return Ok(());
+    }
+    if current.symlink_metadata()?.file_type().is_symlink() {
+        bail!("Config symlinks forbidden");
+    }
+    for entry in fs::read_dir(current)? {
+        let path = entry?.path();
+        let meta = path.symlink_metadata()?;
+        if meta.file_type().is_symlink() {
+            bail!("Config symlinks forbidden");
+        }
+        if meta.is_dir() {
+            if top {
+                bail!("Server settings must be top-level files");
+            }
+            collect_configs(base, &path, prefix, false, result)?;
+        } else {
+            if !meta.is_file() || !config_extension(&path) {
+                bail!("Unsupported configuration file");
+            }
+            let relative = path
+                .strip_prefix(base)?
+                .to_str()
+                .context("Invalid config filename")?;
+            if top && relative == "eula.txt" {
+                bail!("EULA is a local decision");
+            }
+            result.insert(format!("{prefix}{relative}"), path);
+        }
+    }
+    Ok(())
+}
+fn service(action: &str, name: &str) -> Result<Output> {
+    if !name.ends_with(".service")
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_.@-".contains(c))
+        || !name.starts_with(|c: char| c.is_ascii_alphanumeric())
+    {
+        bail!("Invalid service name");
+    }
+    let output = Command::new("sudo")
+        .args(["-n", "/usr/bin/systemctl", action, name])
+        .output()?;
+    if action != "is-active" && !output.status.success() {
+        bail!("systemctl {action} failed");
+    }
+    Ok(output)
+}
+fn copy_atomic(source: &Path, dest: &Path) -> Result<()> {
+    let parent = dest.parent().context("Destination needs parent")?;
+    fs::create_dir_all(parent)?;
+    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+    let mut input = File::open(source)?;
+    std::io::copy(&mut input, &mut temp)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        temp.as_file()
+            .set_permissions(fs::Permissions::from_mode(0o640))?;
+    }
+    temp.as_file().sync_all()?;
+    temp.persist(dest)?;
+    Ok(())
+}
+fn write_properties(source: Option<&Path>, dest: &Path, client: &RconClient) -> Result<()> {
+    if client
+        .password
+        .chars()
+        .any(|c| c == '\n' || c == '\r' || c == '\0')
+    {
+        bail!("RCON password contains forbidden characters");
+    }
+    let mut output = String::new();
+    if let Some(source) = source {
+        for line in fs::read_to_string(source)?.lines() {
+            let key = line
+                .trim_start()
+                .split(['=', ':', ' ', '\t'])
+                .next()
+                .unwrap_or("");
+            if ![
+                "enable-rcon",
+                "rcon.password",
+                "rcon.port",
+                "broadcast-rcon-to-ops",
+            ]
+            .contains(&key)
+            {
+                output.push_str(line);
+                output.push('\n');
+            }
+        }
+    }
+    // Escape Java properties metacharacters; this secret overlay stays local.
+    let password = client
+        .password
+        .replace('\\', "\\\\")
+        .replace(' ', "\\ ")
+        .replace(':', "\\:")
+        .replace('=', "\\=")
+        .replace('#', "\\#")
+        .replace('!', "\\!");
+    output.push_str(&format!(
+        "enable-rcon=true\nrcon.password={password}\nrcon.port={}\nbroadcast-rcon-to-ops=false\n",
+        client.port
+    ));
+    let parent = dest.parent().context("Properties need parent")?;
+    fs::create_dir_all(parent)?;
+    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+    temp.write_all(output.as_bytes())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        temp.as_file()
+            .set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    temp.as_file().sync_all()?;
+    temp.persist(dest)?;
+    Ok(())
+}
+fn wait_healthy(client: &RconClient, name: &str, timeout: u64) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(timeout);
+    loop {
+        if service("is-active", name)?.status.success() && client.online().is_ok() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!("Minecraft readiness timed out");
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+}
+fn paths(config: &Value, key: &str) -> Result<PathBuf> {
+    Ok(PathBuf::from(text(config, "paths", key)?))
+}
+fn client(config: &Value) -> Result<RconClient> {
+    let env = text(config, "rcon", "password_env")?;
+    let password = std::env::var(env).context("RCON secret environment variable missing")?;
+    if password.is_empty() {
+        bail!("RCON password cannot be empty");
+    }
+    Ok(RconClient {
+        host: config["rcon"]["host"]
+            .as_str()
+            .unwrap_or("127.0.0.1")
+            .into(),
+        port: config["rcon"]["port"]
+            .as_u64()
+            .unwrap_or(25575)
+            .try_into()?,
+        password,
+        timeout: Duration::from_secs(config["rcon"]["timeout_seconds"].as_u64().unwrap_or(5)),
+    })
+}
+fn run_inner(config: &Value, bootstrap: bool) -> Result<Value> {
+    let server = paths(config, "server")?;
+    let state_dir = paths(config, "state")?;
+    let backup_root = paths(config, "backups")?;
+    for key in ["server", "state", "cache", "staging", "backups"] {
+        let path = paths(config, key)?;
+        safe_path(&path, ".path-check")?;
+        fs::create_dir_all(path)?;
+    }
+    let state_file = state_dir.join("deployment.json");
+    let state: Value = if state_file.exists() {
+        serde_json::from_slice(&fs::read(&state_file)?)?
+    } else {
+        json!({})
+    };
+    let name = text(config, "deployment", "service")?;
+    let client = client(config)?;
+    if bootstrap {
+        if state_file.exists() {
+            bail!("Bootstrap forbidden after a successful deployment");
+        }
+        let status = service("is-active", name)?;
+        let status_text = String::from_utf8_lossy(&status.stdout);
+        if status.status.success() || !["inactive", "failed"].contains(&status_text.trim()) {
+            bail!("Bootstrap requires explicitly inactive or failed Minecraft service");
+        }
+    }
+    let (commit, repo) = gitrepo::snapshot(
+        text(config, "repository", "url")?,
+        config["repository"]["branch"].as_str().unwrap_or("main"),
+        &paths(config, "repository")?,
+        &paths(config, "staging")?,
+    )?;
+    if state["commit"].as_str() == Some(&commit) {
+        return Ok(json!({"status":"unchanged","commit":commit}));
+    }
+    let mut sources = BTreeMap::new();
+    for (folder, prefix, top) in [
+        ("server-settings", "", true),
+        ("plugins-configs", "plugins/", false),
+    ] {
+        let base = repo.join(folder);
+        collect_configs(&base, &base, prefix, top, &mut sources)?;
+    }
+    let manifest = artifacts::load_manifest(&repo)?;
+    if !manifest.iter().any(|a| a.destination == "server.jar") {
+        bail!("An engine manifest is required");
+    }
+    for artifact in &manifest {
+        let cached = artifacts::download(artifact, &paths(config, "cache")?)?;
+        if sources
+            .insert(artifact.destination.clone(), cached)
+            .is_some()
+        {
+            bail!("Duplicate managed destination");
+        }
+    }
+    let previous: Vec<String> = if state.get("managed_files").is_some() {
+        serde_json::from_value(state["managed_files"].clone())?
+    } else {
+        Vec::new()
+    };
+    let mut owned: BTreeSet<String> = previous
+        .into_iter()
+        .chain(sources.keys().cloned())
+        .collect();
+    owned.insert("server.properties".into());
+    if bootstrap {
+        owned.insert("eula.txt".into());
+    }
+    for relative in &owned {
+        let parts: Vec<_> = Path::new(relative).components().collect();
+        if parts.len() > 1 && !relative.starts_with("plugins/") && !relative.starts_with("mods/") {
+            bail!("Invalid ownership state");
+        }
+        if parts.len() == 1 && relative != "server.jar" && !config_extension(Path::new(relative)) {
+            bail!("Invalid ownership extension");
+        }
+        let dest = safe_path(&server, relative)?;
+        if dest.exists() && !dest.is_file() {
+            bail!("Managed destination is not a regular file");
+        }
+    }
+    if !bootstrap
+        && !wait_empty(
+            || client.online(),
+            Duration::from_secs(seconds(config, "empty_grace_seconds", 60)),
+        )?
+    {
+        return Ok(json!({"status":"waiting_for_players","commit":commit}));
+    }
+    // Grace does not prevent a new connection between this check and service stop.
+    let backup = backup_root.join(format!("{commit}-{}", timestamp()));
+    fs::create_dir_all(&backup)?;
+    if !bootstrap {
+        client.command("save-all flush")?;
+        service("stop", name)?;
+    }
+    let mut existed = BTreeSet::new();
+    let backup_result = (|| -> Result<()> {
+        for relative in &owned {
+            let dest = safe_path(&server, relative)?;
+            if dest.exists() {
+                let target = safe_path(&backup, relative)?;
+                fs::create_dir_all(target.parent().unwrap())?;
+                fs::copy(&dest, &target)?;
+                existed.insert(relative.clone());
+            }
+        }
+        atomic_json(
+            &backup.join("backup.json"),
+            &json!({"commit":state["commit"],"files":existed}),
+        )
+    })();
+    if let Err(error) = backup_result {
+        if !bootstrap {
+            service("start", name)?;
+        }
+        return Err(error.context("Backup failed before mutation"));
+    }
+    let applied = (|| -> Result<()> {
+        for relative in &owned {
+            let dest = safe_path(&server, relative)?;
+            if relative == "server.properties" {
+                write_properties(sources.get(relative).map(PathBuf::as_path), &dest, &client)?;
+            } else if relative == "eula.txt" && bootstrap {
+                fs::write(&dest, "eula=true\n")?;
+            } else if let Some(source) = sources.get(relative) {
+                copy_atomic(source, &dest)?;
+            } else if dest.exists() {
+                fs::remove_file(&dest)?;
+            }
+        }
+        service("start", name)?;
+        wait_healthy(
+            &client,
+            name,
+            seconds(config, "health_timeout_seconds", 120),
+        )
+    })();
+    if let Err(error) = applied {
+        let rollback = (|| -> Result<()> {
+            service("stop", name)?;
+            restore_owned(&server, &backup, &owned, &existed)?;
+            if !bootstrap {
+                service("start", name)?;
+                wait_healthy(
+                    &client,
+                    name,
+                    seconds(config, "health_timeout_seconds", 120),
+                )?;
+            }
+            Ok(())
+        })();
+        atomic_json(
+            &state_dir.join("rollback.json"),
+            &json!({"status":if rollback.is_ok(){"restored"}else{"failed"},"backup":backup,"timestamp":timestamp()}),
+        )?;
+        if rollback.is_err() {
+            bail!("Deployment failed and rollback failed; inspect local journal and backup");
+        }
+        return Err(error.context("Deployment failed; managed files restored (world/plugin data migrations are not rolled back)"));
+    }
+    let mut managed: BTreeSet<String> = sources.keys().cloned().collect();
+    managed.insert("server.properties".into());
+    if bootstrap {
+        managed.insert("eula.txt".into());
+    }
+    let versions: BTreeMap<_, _> = manifest.iter().map(|a| (&a.name, &a.version)).collect();
+    let result = json!({"status":"deployed","commit":commit,"managed_files":managed,"backup":backup,"versions":versions});
+    atomic_json(&state_file, &result)?;
+    Ok(result)
+}
+fn execute(config: &Value, bootstrap: bool) -> Result<Value> {
+    let config = crate::config::validate(config.clone())?;
+    let config = &config;
+    let state = paths(config, "state")?;
+    safe_path(&state, "deploy.lock")?;
+    fs::create_dir_all(&state)?;
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(state.join("deploy.lock"))?;
+    lock.try_lock_exclusive()
+        .context("Another deployment is running")?;
+    let result = run_inner(config, bootstrap);
+    match &result {
+        Ok(value) => atomic_json(&state.join("status.json"), value)?,
+        Err(_) => atomic_json(
+            &state.join("status.json"),
+            &json!({"status":"error","message":"Deployment failed; inspect local journal","timestamp":timestamp()}),
+        )?,
+    }
+    FileExt::unlock(&lock)?;
+    result
+}
+pub fn run(config: &Value) -> Result<Value> {
+    execute(config, false)
+}
+pub fn bootstrap(config: &Value, accept_eula: bool) -> Result<Value> {
+    if !accept_eula {
+        bail!("Bootstrap requires explicit --accept-eula");
+    }
+    execute(config, true)
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn traversal_rejected() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(safe_path(root.path(), "../world/level.dat").is_err());
+        assert!(safe_path(root.path(), "/tmp/outside").is_err());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn symlink_rejected() {
+        let root = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("/tmp", root.path().join("plugins")).unwrap();
+        assert!(safe_path(root.path(), "plugins/test.jar").is_err());
+    }
+    #[test]
+    fn bootstrap_requires_eula() {
+        assert!(bootstrap(&json!({}), false).is_err());
+    }
+    #[test]
+    fn local_rcon_overlay() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        fs::write(
+            &source,
+            "motd=hello\nrcon.password=unsafe\nenable-rcon=false\n",
+        )
+        .unwrap();
+        let dest = root.path().join("properties");
+        let client = RconClient {
+            host: "localhost".into(),
+            port: 25575,
+            password: "secret".into(),
+            timeout: Duration::from_secs(1),
+        };
+        write_properties(Some(&source), &dest, &client).unwrap();
+        let output = fs::read_to_string(dest).unwrap();
+        assert!(output.contains("motd=hello"));
+        assert!(!output.contains("unsafe"));
+        assert!(output.contains("rcon.password=secret"));
+    }
+}
+
+fn wait_empty(mut online: impl FnMut() -> Result<u32>, grace: Duration) -> Result<bool> {
+    if online()? != 0 {
+        return Ok(false);
+    }
+    let deadline = Instant::now() + grace;
+    while Instant::now() < deadline {
+        thread::sleep(
+            Duration::from_millis(500).min(deadline.saturating_duration_since(Instant::now())),
+        );
+        if online()? != 0 {
+            return Ok(false);
+        }
+    }
+    Ok(online()? == 0)
+}
+fn restore_owned(
+    server: &Path,
+    backup: &Path,
+    owned: &BTreeSet<String>,
+    existed: &BTreeSet<String>,
+) -> Result<()> {
+    for relative in owned {
+        let dest = safe_path(server, relative)?;
+        if existed.contains(relative) {
+            copy_atomic(&safe_path(backup, relative)?, &dest)?;
+        } else if dest.exists() {
+            fs::remove_file(&dest)?;
+        }
+    }
+    Ok(())
+}
+#[cfg(test)]
+mod transaction_tests {
+    use super::*;
+    #[test]
+    fn online_failure_and_player_arrival_defer() {
+        assert!(wait_empty(|| anyhow::bail!("unavailable"), Duration::ZERO).is_err());
+        assert!(!wait_empty(|| Ok(2), Duration::ZERO).unwrap());
+        let mut counts = vec![0, 1].into_iter();
+        assert!(!wait_empty(|| Ok(counts.next().unwrap()), Duration::ZERO).unwrap());
+    }
+    #[test]
+    fn rollback_restores_only_owned_files() {
+        let root = tempfile::tempdir().unwrap();
+        let server = root.path().join("server");
+        let backup = root.path().join("backup");
+        fs::create_dir_all(server.join("plugins")).unwrap();
+        fs::create_dir_all(backup.join("plugins")).unwrap();
+        fs::write(server.join("plugins/old.jar"), "new").unwrap();
+        fs::write(backup.join("plugins/old.jar"), "old").unwrap();
+        fs::write(server.join("plugins/new.jar"), "new").unwrap();
+        fs::write(server.join("plugins/foreign.jar"), "foreign").unwrap();
+        fs::create_dir_all(server.join("world")).unwrap();
+        fs::write(server.join("world/level.dat"), "world").unwrap();
+        let owned = BTreeSet::from(["plugins/old.jar".into(), "plugins/new.jar".into()]);
+        let existed = BTreeSet::from(["plugins/old.jar".into()]);
+        restore_owned(&server, &backup, &owned, &existed).unwrap();
+        assert_eq!(
+            fs::read_to_string(server.join("plugins/old.jar")).unwrap(),
+            "old"
+        );
+        assert!(!server.join("plugins/new.jar").exists());
+        assert_eq!(
+            fs::read_to_string(server.join("plugins/foreign.jar")).unwrap(),
+            "foreign"
+        );
+        assert_eq!(
+            fs::read_to_string(server.join("world/level.dat")).unwrap(),
+            "world"
+        );
+    }
+    #[test]
+    fn concurrent_lock_rejected() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("lock");
+        let one = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let two = OpenOptions::new().write(true).open(&path).unwrap();
+        one.try_lock_exclusive().unwrap();
+        assert!(two.try_lock_exclusive().is_err());
+        FileExt::unlock(&one).unwrap();
+    }
+}
