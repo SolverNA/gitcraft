@@ -37,7 +37,7 @@ cargo test --locked
 - Mappings `server-settings/`, `plugins-configs/`, `config/`, `defaultconfigs/`.
 - HTTPS pins с SHA-256 и отдельные transfer-backed pins с проверенными receipt.
 - Прямой resumable transport: authentication, scoped sessions, chunks, offsets, SHA, квоты, verify и явное подтверждение замены мира.
-- Loopback Web UI: статус, repository/branch onboarding, export/adopt планы, PR-предложения из рабочего clone и browser transfer; CLI и YAML остаются доступны.
+- Loopback Web UI: статус, repository/branch onboarding, export/adopt планы, ограниченный approved-config editor с diff/PR из отдельного clone и browser transfer; CLI и YAML остаются доступны.
 - Настраиваемый poll в долгоживущем systemd agent, RCON fail-closed и межпроцессная блокировка.
 - Durable journal, backup hashes, осознанное stopped recovery после старта новой Java; отдельные offline game-data backups.
 
