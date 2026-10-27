@@ -20,7 +20,7 @@ use tiny_http::{Header, Request, Response, Server};
 pub fn status(value: &Value) -> Value {
     let mut result = json!({"service":value["deployment"]["service"]});
     if let Some(state) = value["paths"]["state"].as_str() {
-        for name in ["status", "deployment"] {
+        for name in ["status", "deployment", "ui-operation"] {
             if let Ok(text) = fs::read_to_string(Path::new(state).join(format!("{name}.json")))
                 && let Ok(v) = serde_json::from_str::<Value>(&text)
             {
@@ -204,6 +204,57 @@ fn transfer_page(csrf: &str) -> String {
         "<h2>Прямой перенос local → VPS</h2><p>Данные идут прямо на этот сервер через SSH-туннель. Миры и JAR не попадают в Git или стороннее хранилище.</p><p>Браузер: максимум 64 MiB на файл, размер проверяется до чтения. Для больших файлов: <code>gitcraft transfer plan --source PATH --kind world --source-consistency stopped --output plan.json</code>, затем <code>gitcraft transfer send --endpoint http://127.0.0.1:8765 --plan plan.json --session session.json</code>. Для JAR укажите kind engine/plugin/mod.</p><input id=csrf type=hidden value='{csrf}'><label>Тип <select id=kind><option value=world>Мир (папка)</option><option value=engine>Ядро</option><option value=plugin>Плагины</option><option value=mod>Моды</option></select></label><p><input id=files type=file multiple><input id=folder type=file webkitdirectory multiple></p><label><input id=consistent type=checkbox>Локальный Minecraft остановлен или выбрана заранее сделанная согласованная snapshot-копия</label><p><select id=consistency><option value=stopped>Источник остановлен</option><option value=snapshot>Готовый snapshot</option></select></p><button id=send>Передать / продолжить</button><button id=verify>Проверить целые файлы</button><p><label><input id=confirm type=checkbox>Подтверждаю замену выбранных миров на VPS с резервной копией. Minecraft на VPS остановлен.</label></p><button id=commit>Применить проверенный перенос</button><button id=status>Статус</button><button id=recover>Восстановить прерванную замену (сервер остановлен)</button><progress id=progress max=100 value=0></progress><pre id=output>Выберите файлы/папку. При возобновлении выберите тот же источник.</pre><p>Session token хранится только в localStorage этого браузера; не передавайте его другим. После рестарта сервер сохранит смещения. Окончательное применение никогда не запускает Minecraft автоматически.</p><a href='/'>Панель</a><script src='/assets/transfer.js'></script>"
     )
 }
+fn onboarding_page(csrf: &str, current: &Value) -> String {
+    let hidden = format!("<input type=hidden name=csrf value='{csrf}'>");
+    format!(
+        "<h2>Подключение и проверка перед изменением</h2><p>Настройки подключения сначала сохраняются как план. Git-конфиги редактируются в отдельном рабочем клоне и отправляются через PR; bare-кэш агента для этого не подходит. GitHub write credentials нужны только локальному gh пользователя, серверу деплоя достаточно read-only ключа.</p><h3>Репозиторий / ветка</h3><form method=post action=/onboarding-plan>{hidden}<input name=url required value='{}'><input name=branch required value='{}'><button>Показать план</button></form><h3>Экспорт настроек из доступной этому процессу папки</h3><p>Для локального Minecraft запустите эту панель локально или используйте gitcraft export plan/apply. Браузер не открывает произвольные пути на другой машине.</p><form method=post action=/export-plan>{hidden}<input name=server required placeholder='/path/to/stopped-local-server'><textarea name=include placeholder='Явно выбранные относительные пути, по одному на строку'></textarea><input name=metadata placeholder='/path/to/artifacts-metadata.json'><button>Сканировать и показать план</button></form><h3>Предложить проверенные правки через PR</h3><form method=post action=/propose>{hidden}<input name=repository required placeholder='/path/to/separate-working-clone'><input name=base value=main required><input name=title value='Minecraft configuration update' required><label><input type=checkbox name=reviewed value=yes required>Я проверил локальные изменения</label><button>Создать ветку и PR</button></form><h3>Подключить существующий сервер без перезаписи unit/Java/RCON</h3><form method=post action=/adopt-plan>{hidden}<input name=server required value='{}'><button>Показать adopt-план</button></form><a href='/'>Панель</a>",
+        escape(current["repository"]["url"].as_str().unwrap_or("")),
+        escape(current["repository"]["branch"].as_str().unwrap_or("main")),
+        escape(current["paths"]["server"].as_str().unwrap_or(""))
+    )
+}
+fn ui_plan_path(current: &Value, name: &str) -> Result<PathBuf> {
+    let state = Path::new(
+        current["paths"]["state"]
+            .as_str()
+            .context("state missing")?,
+    );
+    fs::create_dir_all(state)?;
+    crate::deploy::safe_path(state, name)
+}
+fn write_ui_plan(path: &Path, value: &Value) -> Result<String> {
+    use std::io::Write;
+    let bytes = serde_json::to_vec_pretty(value)?;
+    let mut tmp = tempfile::NamedTempFile::new_in(path.parent().context("plan parent")?)?;
+    tmp.write_all(&bytes)?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(path)?;
+    Ok(hex::encode(Sha256::digest(bytes)))
+}
+fn reviewed_plan(path: &Path, form: &HashMap<String, String>) -> Result<Value> {
+    anyhow::ensure!(
+        form.get("reviewed").is_some_and(|v| v == "yes"),
+        "explicit review confirmation required"
+    );
+    let bytes = fs::read(path)?;
+    anyhow::ensure!(
+        form.get("digest") == Some(&hex::encode(Sha256::digest(&bytes))),
+        "plan changed; review it again"
+    );
+    Ok(serde_json::from_slice(&bytes)?)
+}
+fn review_html(
+    csrf: &str,
+    action: &str,
+    digest: &str,
+    plan: &Value,
+    extra: &str,
+) -> Result<String> {
+    Ok(format!(
+        "<h2>План — проверьте перед применением</h2><pre>{}</pre><form method=post action='{action}'><input type=hidden name=csrf value='{csrf}'><input type=hidden name=digest value='{digest}'>{extra}<label><input type=checkbox name=reviewed value=yes required>Я проверил план</label><button>Применить этот план</button></form><a href='/onboarding'>Назад</a>",
+        escape(&serde_json::to_string_pretty(plan)?)
+    ))
+}
 
 pub fn serve(path: &Path) -> Result<()> {
     let value = config::load(path)?;
@@ -265,6 +316,19 @@ pub fn serve(path: &Path) -> Result<()> {
                     "Войдите через <a href='/'>панель</a>.".into(),
                     None,
                 );
+            }
+            continue;
+        }
+        if method == "GET" && url == "/onboarding" {
+            if let Some(csrf) = csrf {
+                respond(
+                    request,
+                    200,
+                    onboarding_page(&csrf, &config::load(path)?),
+                    None,
+                );
+            } else {
+                respond(request, 403, "Login required".into(), None);
             }
             continue;
         }
@@ -351,6 +415,161 @@ pub fn serve(path: &Path) -> Result<()> {
             continue;
         }
         match url.as_str() {
+            "/onboarding-plan" | "/onboarding-apply" | "/export-plan" | "/export-apply"
+            | "/adopt-plan" | "/adopt-apply" => {
+                let outcome = (|| -> Result<String> {
+                    let _guard = settings_lock
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("settings lock unavailable"))?;
+                    let current = config::load(path)?;
+                    let csrf = csrf.as_deref().context("session missing")?;
+                    match url.as_str() {
+                        "/onboarding-plan" => {
+                            let mut proposed = current.clone();
+                            proposed["repository"]["url"] =
+                                json!(form.get("url").context("repository URL missing")?);
+                            proposed["repository"]["branch"] =
+                                json!(form.get("branch").context("branch missing")?);
+                            let proposed = config::validate(proposed)?;
+                            let plan = json!({"previous":current,"proposed":proposed});
+                            let digest = write_ui_plan(
+                                &ui_plan_path(&current, "ui-onboarding.json")?,
+                                &plan,
+                            )?;
+                            review_html(csrf, "/onboarding-apply", &digest, &plan, "")
+                        }
+                        "/onboarding-apply" => {
+                            let p = ui_plan_path(&current, "ui-onboarding.json")?;
+                            let plan = reviewed_plan(&p, &form)?;
+                            anyhow::ensure!(
+                                plan["previous"] == current,
+                                "configuration changed; create a fresh plan"
+                            );
+                            config::save(path, plan["proposed"].clone())?;
+                            fs::remove_file(p)?;
+                            Ok("<p>Подключение сохранено. Следующая проверка агента перечитает конфигурацию.</p><a href='/'>Панель</a>".into())
+                        }
+                        "/export-plan" => {
+                            let source =
+                                PathBuf::from(form.get("server").context("source missing")?);
+                            let include: Vec<String> = form
+                                .get("include")
+                                .map(String::as_str)
+                                .unwrap_or("")
+                                .lines()
+                                .map(str::trim)
+                                .filter(|p| !p.is_empty())
+                                .map(str::to_owned)
+                                .collect();
+                            let metadata = form
+                                .get("metadata")
+                                .filter(|p| !p.trim().is_empty())
+                                .map(PathBuf::from);
+                            let plan = crate::export::plan(&source, &include, metadata.as_deref())?;
+                            let digest =
+                                write_ui_plan(&ui_plan_path(&current, "ui-export.json")?, &plan)?;
+                            review_html(
+                                csrf,
+                                "/export-apply",
+                                &digest,
+                                &plan,
+                                "<input name=destination required placeholder='/path/to/separate-working-clone'>",
+                            )
+                        }
+                        "/export-apply" => {
+                            let p = ui_plan_path(&current, "ui-export.json")?;
+                            reviewed_plan(&p, &form)?;
+                            let destination = PathBuf::from(
+                                form.get("destination").context("destination missing")?,
+                            );
+                            let result = crate::export::apply(&p, &destination, true)?;
+                            Ok(format!(
+                                "<pre>{}</pre><p>Изменения подготовлены локально. Проверьте diff и отправьте PR через onboarding.</p><a href='/onboarding'>Назад</a>",
+                                escape(&result.to_string())
+                            ))
+                        }
+                        "/adopt-plan" => {
+                            let server =
+                                PathBuf::from(form.get("server").context("server missing")?);
+                            let plan = crate::adopt::plan(&current, &server)?;
+                            let digest =
+                                write_ui_plan(&ui_plan_path(&current, "ui-adopt.json")?, &plan)?;
+                            review_html(
+                                csrf,
+                                "/adopt-apply",
+                                &digest,
+                                &plan,
+                                "<input name=repository required placeholder='/path/to/reviewed-config-checkout'><input name=expected_commit required placeholder='Full approved commit SHA'>",
+                            )
+                        }
+                        "/adopt-apply" => {
+                            let plan =
+                                reviewed_plan(&ui_plan_path(&current, "ui-adopt.json")?, &form)?;
+                            let repo = PathBuf::from(
+                                form.get("repository").context("repository missing")?,
+                            );
+                            let expected = form
+                                .get("expected_commit")
+                                .context("approved commit missing")?;
+                            let result = crate::adopt::apply(&current, &plan, &repo, expected)?;
+                            Ok(format!(
+                                "<pre>{}</pre><a href='/'>Панель</a>",
+                                escape(&result.to_string())
+                            ))
+                        }
+                        _ => bail!("unknown onboarding action"),
+                    }
+                })();
+                match outcome {
+                    Ok(html) => respond(request, 200, html, None),
+                    Err(error) => respond(
+                        request,
+                        400,
+                        format!(
+                            "<p>Ошибка: {}</p><a href='/onboarding'>Назад</a>",
+                            escape(&error.to_string())
+                        ),
+                        None,
+                    ),
+                }
+            }
+            "/propose" => {
+                if busy.swap(true, Ordering::SeqCst) {
+                    respond(request, 409, "Operation already running".into(), None);
+                    continue;
+                }
+                if !form.get("reviewed").is_some_and(|v| v == "yes") {
+                    busy.store(false, Ordering::SeqCst);
+                    respond(request, 400, "Review confirmation required".into(), None);
+                    continue;
+                }
+                let busy = busy.clone();
+                let path = path.to_path_buf();
+                let repo = PathBuf::from(form.get("repository").cloned().unwrap_or_default());
+                let base = form.get("base").cloned().unwrap_or_default();
+                let title = form.get("title").cloned().unwrap_or_default();
+                std::thread::spawn(move || {
+                    let outcome = (|| -> Result<()> {
+                        let current = config::load(&path)?;
+                        let target = ui_plan_path(&current, "ui-operation.json")?;
+                        write_ui_plan(&target, &json!({"status":"running","operation":"propose"}))?;
+                        let result = crate::repository::propose(&repo, &base, &title);
+                        let value = match result {
+                            Ok(result) => json!({"status":"complete","result":result}),
+                            Err(error) => json!({"status":"error","error":error.to_string()}),
+                        };
+                        write_ui_plan(&target, &value)?;
+                        Ok(())
+                    })();
+                    if outcome.is_err() {
+                        eprintln!(
+                            "UI proposal failed; inspect local configuration and credentials"
+                        );
+                    }
+                    busy.store(false, Ordering::SeqCst);
+                });
+                respond(request,202,"<p>Создание PR запущено. Результат или ошибка появится в состоянии панели; успех пока не подтверждён.</p><a href='/'>Панель</a>".into(),None);
+            }
             "/logout" => {
                 if let Some(id) = session_id {
                     sessions.remove(&id);
