@@ -147,7 +147,17 @@ fn transfer_api(mut request: Request, path: &Path, admin: &str, session_csrf: Op
                         .is_some_and(|(a, b)| equal(a, b)),
                 "authentication required"
             );
-            let manifest = serde_json::from_value(read_json(&mut request, 16 * 1024 * 1024)?)?;
+            let manifest: transfer::Manifest =
+                serde_json::from_value(read_json(&mut request, 16 * 1024 * 1024)?)?;
+            if !equal(admin, &bearer) {
+                anyhow::ensure!(
+                    manifest
+                        .files
+                        .iter()
+                        .all(|f| f.size <= transfer::BROWSER_FILE_BYTES),
+                    "browser file exceeds 64 MiB; use gitcraft transfer plan/send streaming CLI"
+                );
+            }
             return transfer::create(&config, manifest);
         }
         let pieces: Vec<_> = route.trim_start_matches('/').split('/').collect();
@@ -538,7 +548,7 @@ pub fn serve(path: &Path) -> Result<()> {
                     respond(request, 409, "Operation already running".into(), None);
                     continue;
                 }
-                if !form.get("reviewed").is_some_and(|v| v == "yes") {
+                if form.get("reviewed").is_none_or(|v| v != "yes") {
                     busy.store(false, Ordering::SeqCst);
                     respond(request, 400, "Review confirmation required".into(), None);
                     continue;

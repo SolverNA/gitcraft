@@ -13,3 +13,4 @@ jobs:
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
       - run: bash scripts/test-install.sh
+      - run: node scripts/test-transfer-ui.cjs
