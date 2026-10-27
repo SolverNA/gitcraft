@@ -26,13 +26,14 @@ fn timestamp() -> u128 {
         .unwrap_or_default()
         .as_millis()
 }
-fn atomic_json(path: &Path, value: &Value) -> Result<()> {
+pub(crate) fn atomic_json(path: &Path, value: &Value) -> Result<()> {
     let parent = path.parent().context("State needs parent")?;
     fs::create_dir_all(parent)?;
     let mut temp = tempfile::NamedTempFile::new_in(parent)?;
     serde_json::to_writer_pretty(&mut temp, value)?;
     temp.as_file().sync_all()?;
     temp.persist(path)?;
+    File::open(parent)?.sync_all()?;
     Ok(())
 }
 pub fn safe_path(root: &Path, relative: &str) -> Result<PathBuf> {
@@ -71,7 +72,7 @@ fn config_extension(path: &Path) -> bool {
         .and_then(|s| s.to_str())
         .is_some_and(|s| ["yml", "yaml", "properties", "json", "txt", "toml", "conf"].contains(&s))
 }
-fn collect_configs(
+pub(crate) fn collect_configs(
     base: &Path,
     current: &Path,
     prefix: &str,
@@ -140,6 +141,16 @@ fn service(action: &str, name: &str) -> Result<Output> {
     }
     Ok(output)
 }
+pub fn ensure_stopped(config: &Value) -> Result<()> {
+    let status = service("is-active", text(config, "deployment", "service")?)?;
+    let output = String::from_utf8_lossy(&status.stdout);
+    if status.status.success() || !["inactive", "failed"].contains(&output.trim()) {
+        bail!(
+            "Operation requires explicitly stopped Minecraft service; unknown service status is unsafe"
+        );
+    }
+    Ok(())
+}
 fn copy_atomic(source: &Path, dest: &Path) -> Result<()> {
     let parent = dest.parent().context("Destination needs parent")?;
     fs::create_dir_all(parent)?;
@@ -154,6 +165,7 @@ fn copy_atomic(source: &Path, dest: &Path) -> Result<()> {
     }
     temp.as_file().sync_all()?;
     temp.persist(dest)?;
+    File::open(parent)?.sync_all()?;
     Ok(())
 }
 fn write_properties(source: Option<&Path>, dest: &Path, client: &RconClient) -> Result<()> {
@@ -210,9 +222,13 @@ fn write_properties(source: Option<&Path>, dest: &Path, client: &RconClient) -> 
     }
     temp.as_file().sync_all()?;
     temp.persist(dest)?;
+    File::open(parent)?.sync_all()?;
     Ok(())
 }
 trait Runtime {
+    fn checkpoint(&mut self, _phase: &str) -> Result<()> {
+        Ok(())
+    }
     fn online(&mut self) -> Result<u32>;
     fn command(&mut self, command: &str) -> Result<String>;
     fn service(&mut self, action: &str, name: &str) -> Result<Output>;
@@ -258,7 +274,7 @@ impl Runtime for LiveRuntime<'_> {
 fn paths(config: &Value, key: &str) -> Result<PathBuf> {
     Ok(PathBuf::from(text(config, "paths", key)?))
 }
-fn client(config: &Value) -> Result<RconClient> {
+pub(crate) fn client(config: &Value) -> Result<RconClient> {
     let env = text(config, "rcon", "password_env")?;
     let password = std::env::var(env).context("RCON secret environment variable missing")?;
     if password.is_empty() {
@@ -333,16 +349,19 @@ fn run_transaction(
     if state["commit"].as_str() == Some(&commit) {
         return Ok(json!({"status":"unchanged","commit":commit}));
     }
+    crate::policy::validate_repository(&repo)?;
     let mut sources = BTreeMap::new();
     for (folder, prefix, top) in [
         ("server-settings", "", true),
         ("plugins-configs", "plugins/", false),
+        ("config", "config/", false),
+        ("defaultconfigs", "defaultconfigs/", false),
     ] {
         let base = repo.join(folder);
         collect_configs(&base, &base, prefix, top, &mut sources)?;
     }
     let manifest = artifacts::load_manifest(&repo)?;
-    if !manifest.iter().any(|a| a.destination == "server.jar") {
+    if !manifest.iter().any(|a| !a.destination.contains('/')) {
         bail!("An engine manifest is required");
     }
     for artifact in &manifest {
@@ -369,10 +388,16 @@ fn run_transaction(
     }
     for relative in &owned {
         let parts: Vec<_> = Path::new(relative).components().collect();
-        if parts.len() > 1 && !relative.starts_with("plugins/") && !relative.starts_with("mods/") {
+        if parts.len() > 1
+            && !relative.starts_with("plugins/")
+            && !relative.starts_with("mods/")
+            && !relative.starts_with("config/")
+            && !relative.starts_with("defaultconfigs/")
+        {
             bail!("Invalid ownership state");
         }
-        if parts.len() == 1 && relative != "server.jar" && !config_extension(Path::new(relative)) {
+        if parts.len() == 1 && !relative.ends_with(".jar") && !config_extension(Path::new(relative))
+        {
             bail!("Invalid ownership extension");
         }
         let dest = safe_path(&server, relative)?;
@@ -388,13 +413,19 @@ fn run_transaction(
     {
         return Ok(json!({"status":"waiting_for_players","commit":commit}));
     }
-    // Grace does not prevent a new connection between this check and service stop.
+    // Journal is durable before stop or any managed mutation; recovery never touches worlds.
     let backup = backup_root.join(format!("{commit}-{}", timestamp()));
     fs::create_dir_all(&backup)?;
+    let mut journal = json!({"phase":"prepared","server":server,"backup":backup,"commit":commit,"owned":owned,"previous_state":if state_file.exists(){state.clone()}else{Value::Null},"backup_hashes":{},"may_have_started":false,"bootstrap":bootstrap});
+    crate::recovery::save(config, &journal)?;
+    runtime.checkpoint("prepared")?;
+    // Grace does not prevent a new connection between this check and service stop.
     if !bootstrap {
         runtime.command("save-all flush")?;
         runtime.service("stop", name)?;
     }
+    crate::recovery::phase(config, &mut journal, "stopped")?;
+    runtime.checkpoint("stopped")?;
     let mut existed = BTreeSet::new();
     let backup_result = (|| -> Result<()> {
         for relative in &owned {
@@ -402,7 +433,7 @@ fn run_transaction(
             if dest.exists() {
                 let target = safe_path(&backup, relative)?;
                 fs::create_dir_all(target.parent().unwrap())?;
-                fs::copy(&dest, &target)?;
+                copy_atomic(&dest, &target)?;
                 existed.insert(relative.clone());
             }
         }
@@ -415,8 +446,21 @@ fn run_transaction(
         if !bootstrap {
             runtime.service("start", name)?;
         }
+        crate::recovery::finish(config, &journal)?;
         return Err(error.context("Backup failed before mutation"));
     }
+    let mut backup_hashes = BTreeMap::new();
+    for relative in &existed {
+        backup_hashes.insert(
+            relative.clone(),
+            artifacts::sha256(&safe_path(&backup, relative)?)?,
+        );
+    }
+    journal["backup_hashes"] = json!(backup_hashes);
+    crate::recovery::phase(config, &mut journal, "backed_up")?;
+    runtime.checkpoint("backed_up")?;
+    crate::recovery::phase(config, &mut journal, "applying")?;
+    runtime.checkpoint("applying")?;
     let applied = (|| -> Result<()> {
         for relative in &owned {
             let dest = safe_path(&server, relative)?;
@@ -430,12 +474,20 @@ fn run_transaction(
                 copy_atomic(source, &dest)?;
             } else if dest.exists() {
                 fs::remove_file(&dest)?;
+                File::open(dest.parent().unwrap())?.sync_all()?;
             }
+            runtime.checkpoint("file_applied")?;
         }
+        crate::recovery::phase(config, &mut journal, "starting")?;
+        runtime.checkpoint("starting")?;
         runtime.service("start", name)?;
-        runtime.healthy(name, seconds(config, "health_timeout_seconds", 120))
+        runtime.healthy(name, seconds(config, "health_timeout_seconds", 120))?;
+        crate::recovery::phase(config, &mut journal, "healthy")?;
+        runtime.checkpoint("healthy")?;
+        Ok(())
     })();
     if let Err(error) = applied {
+        crate::recovery::phase(config, &mut journal, "rolling_back")?;
         let rollback = (|| -> Result<()> {
             runtime.service("stop", name)?;
             restore_owned(&server, &backup, &owned, &existed)?;
@@ -452,6 +504,7 @@ fn run_transaction(
         if rollback.is_err() {
             bail!("Deployment failed and rollback failed; inspect local journal and backup");
         }
+        crate::recovery::finish(config, &journal)?;
         return Err(error.context("Deployment failed; managed files restored (world/plugin data migrations are not rolled back)"));
     }
     let mut managed: BTreeSet<String> = sources.keys().cloned().collect();
@@ -462,6 +515,9 @@ fn run_transaction(
     let versions: BTreeMap<_, _> = manifest.iter().map(|a| (&a.name, &a.version)).collect();
     let result = json!({"status":"deployed","commit":commit,"managed_files":managed,"backup":backup,"versions":versions});
     atomic_json(&state_file, &result)?;
+    crate::recovery::phase(config, &mut journal, "committed")?;
+    runtime.checkpoint("committed")?;
+    crate::recovery::finish(config, &journal)?;
     Ok(result)
 }
 fn execute(config: &Value, bootstrap: bool) -> Result<Value> {
@@ -477,7 +533,12 @@ fn execute(config: &Value, bootstrap: bool) -> Result<Value> {
         .open(state.join("deploy.lock"))?;
     lock.try_lock_exclusive()
         .context("Another deployment is running")?;
-    let result = run_inner(config, bootstrap);
+    let result = if let Some(journal) = crate::recovery::pending(config)? {
+        ensure_stopped(config)?;
+        crate::recovery::restore_stopped(config, &journal, false)
+    } else {
+        run_inner(config, bootstrap)
+    };
     match &result {
         Ok(value) => atomic_json(&state.join("status.json"), value)?,
         Err(_) => atomic_json(
@@ -638,11 +699,18 @@ mod integration_tests {
         commit: String,
         online: Option<u32>,
         actions: Vec<String>,
+        crash_after: Option<String>,
         fail_first_readiness: bool,
         readiness_calls: usize,
         state: PathBuf,
     }
     impl Runtime for FakeRuntime {
+        fn checkpoint(&mut self, phase: &str) -> Result<()> {
+            if self.crash_after.as_deref() == Some(phase) {
+                panic!("simulated process interruption at {phase}");
+            }
+            Ok(())
+        }
         fn online(&mut self) -> Result<u32> {
             self.online.context("RCON unavailable")
         }
@@ -787,6 +855,7 @@ mod integration_tests {
                     commit,
                     online: Some(0),
                     actions: vec![],
+                    crash_after: None,
                     fail_first_readiness: false,
                     readiness_calls: 0,
                     state,
@@ -795,6 +864,85 @@ mod integration_tests {
         }
     }
     use sha2::Digest;
+    #[test]
+    fn durable_journal_recovers_every_interruption_phase_without_restarting() {
+        for phase in [
+            "prepared",
+            "stopped",
+            "backed_up",
+            "applying",
+            "file_applied",
+            "starting",
+            "healthy",
+            "committed",
+        ] {
+            let mut fixture = Fixture::new();
+            fixture.runtime.crash_after = Some(phase.into());
+            let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_transaction(
+                    &fixture.config,
+                    false,
+                    &fixture.client,
+                    &mut fixture.runtime,
+                )
+            }));
+            assert!(interrupted.is_err());
+            // Reconstruct solely from durable disk state, as a new process would.
+            let journal = crate::recovery::pending(&fixture.config).unwrap().unwrap();
+            if ["starting", "healthy", "committed"].contains(&phase) {
+                assert!(
+                    crate::recovery::restore_stopped(&fixture.config, &journal, false).is_err()
+                );
+            }
+            let result = crate::recovery::restore_stopped(&fixture.config, &journal, true).unwrap();
+            assert_eq!(result["service_restarted"], false);
+            assert!(crate::recovery::pending(&fixture.config).unwrap().is_none());
+            let server = paths(&fixture.config, "server").unwrap();
+            assert_eq!(
+                fs::read_to_string(server.join("server.jar")).unwrap(),
+                "old jar"
+            );
+            assert_eq!(
+                fs::read_to_string(server.join("server.properties")).unwrap(),
+                "motd=old\n"
+            );
+            assert_eq!(
+                fs::read_to_string(server.join("world/level.dat")).unwrap(),
+                "world"
+            );
+            let state: Value = serde_json::from_slice(
+                &fs::read(fixture.runtime.state.join("deployment.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(state["commit"], "previous");
+        }
+    }
+    #[test]
+    fn corrupt_backup_refuses_recovery_before_any_restore() {
+        let mut fixture = Fixture::new();
+        fixture.runtime.crash_after = Some("starting".into());
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_transaction(
+                &fixture.config,
+                false,
+                &fixture.client,
+                &mut fixture.runtime,
+            )
+        }));
+        let journal = crate::recovery::pending(&fixture.config).unwrap().unwrap();
+        fs::write(
+            Path::new(journal["backup"].as_str().unwrap()).join("server.jar"),
+            "corrupted",
+        )
+        .unwrap();
+        assert!(crate::recovery::restore_stopped(&fixture.config, &journal, true).is_err());
+        assert_eq!(
+            fs::read_to_string(paths(&fixture.config, "server").unwrap().join("server.jar"))
+                .unwrap(),
+            "new jar"
+        );
+        assert!(crate::recovery::pending(&fixture.config).unwrap().is_some());
+    }
     #[test]
     fn successful_transaction_commits_after_readiness_and_retains_eula() {
         let mut fixture = Fixture::new();
