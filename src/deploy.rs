@@ -259,7 +259,7 @@ fn write_properties(source: Option<&Path>, dest: &Path, client: &RconClient) -> 
     File::open(parent)?.sync_all()?;
     Ok(())
 }
-trait Runtime {
+pub(crate) trait Runtime {
     fn checkpoint(&mut self, _phase: &str) -> Result<()> {
         Ok(())
     }
@@ -336,7 +336,7 @@ fn run_inner(config: &Value, bootstrap: bool) -> Result<Value> {
         &mut LiveRuntime { client: &client },
     )
 }
-fn run_transaction(
+pub(crate) fn run_transaction(
     config: &Value,
     bootstrap: bool,
     client: &RconClient,
