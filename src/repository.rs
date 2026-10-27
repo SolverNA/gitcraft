@@ -1,13 +1,52 @@
 //! Create review branches and PRs; never push a deployment branch directly.
 use anyhow::{Context, Result, ensure};
+use fs2::FileExt;
 use serde_json::{Value, json};
 use std::{
     collections::BTreeSet,
+    fs::{self, OpenOptions},
     io::Write,
     path::Path,
     process::Command,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+
+fn audit_index(repo: &Path) -> Result<String> {
+    let tree = command(repo, "git", &["write-tree"])?;
+    let tree = tree.trim();
+    let listing = command(repo, "git", &["ls-tree", "-rz", "--full-tree", tree])?;
+    let snapshot = tempfile::tempdir()?;
+    for record in listing.split('\0').filter(|record| !record.is_empty()) {
+        let (metadata, path) = record.split_once('\t').context("Malformed staged tree")?;
+        crate::policy::relative(path)?;
+        let fields: Vec<_> = metadata.split_whitespace().collect();
+        ensure!(
+            fields.len() == 3 && fields[1] == "blob" && ["100644", "100755"].contains(&fields[0]),
+            "Symlinks and special Git objects are forbidden"
+        );
+        let content = crate::gitrepo::run_bounded(
+            Command::new("git")
+                .current_dir(repo)
+                .args(["cat-file", "blob", fields[2]]),
+            Duration::from_secs(30),
+        )?;
+        ensure!(
+            content.status.success() && content.stdout.len() < 1024 * 1024,
+            "Staged file exceeds exact-audit limit"
+        );
+        let target = snapshot.path().join(path);
+        fs::create_dir_all(target.parent().context("Snapshot parent")?)?;
+        fs::write(target, content.stdout)?;
+    }
+    command(snapshot.path(), "git", &["init", "--quiet"])?;
+    command(
+        snapshot.path(),
+        "git",
+        &["add", "--all", "--force", "--", "."],
+    )?;
+    crate::policy::validate_repository(snapshot.path())?;
+    Ok(tree.to_owned())
+}
 fn command(repo: &Path, program: &str, args: &[&str]) -> Result<String> {
     let output=crate::gitrepo::run_bounded(Command::new(program).current_dir(repo).args(args).env("GIT_TERMINAL_PROMPT","0").env("GIT_SSH_COMMAND","ssh -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=2"),Duration::from_secs(180))?;
     ensure!(
@@ -36,12 +75,19 @@ pub fn propose(repo: &Path, base: &str, title: &str) -> Result<Value> {
         "Invalid deployment branch"
     );
     ensure!(
-        repo.join(".git").is_dir(),
+        repo.join(".git").is_dir() && !repo.join(".git").is_symlink(),
         "Proposals require a normal configuration working clone, not the agent's bare repository"
     );
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(repo.join(".git/gitcraft-propose.lock"))?;
+    lock.try_lock_exclusive()
+        .context("Another configuration proposal is running")?;
     crate::policy::validate_repository(repo)?;
     command(repo, "gh", &["auth", "status"])?;
-    let origin = command(repo, "git", &["remote", "get-url", "origin"])?;
+    let origin = command(repo, "git", &["config", "--get", "remote.origin.url"])?;
     let origin = origin.trim();
     ensure!(
         origin.starts_with("git@github.com:") || origin.starts_with("https://github.com/"),
@@ -111,7 +157,12 @@ pub fn propose(repo: &Path, base: &str, title: &str) -> Result<Value> {
     stage.extend(paths.iter().copied());
     command(repo, "git", &stage)?;
     crate::policy::validate_repository(repo)?;
+    let reviewed_tree = audit_index(repo)?;
     command(repo, "git", &["commit", "-m", title])?;
+    ensure!(
+        command(repo, "git", &["rev-parse", "HEAD^{tree}"])?.trim() == reviewed_tree,
+        "Committed tree changed after validation; refusing to push"
+    );
     let commit = command(repo, "git", &["rev-parse", "HEAD"])?;
     command(
         repo,
@@ -149,7 +200,6 @@ pub fn propose(repo: &Path, base: &str, title: &str) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
     #[test]
     fn invalid_branch_and_bare_repo_fail_before_network() {
         let temp = tempfile::tempdir().unwrap();
