@@ -20,7 +20,8 @@ with other plugins; human approval and backups remain necessary.
 
 `GITCRAFT_TOOL_REPOSITORY` and `GITCRAFT_TOOL_REF` repository variables identify
 the reviewed tool source and a full 40-character commit SHA. The setup script
-sets these. For dependency PRs allow GitHub Actions to create pull requests in
+sets these. This MVP expects the tool repository to be publicly readable;
+the configuration repository can be private. For dependency PRs allow GitHub Actions to create pull requests in
 repository Settings → Actions → General. Configure protected `main` and required
 reviews/checks yourself; organization policy may constrain these settings.
 

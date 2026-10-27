@@ -29,4 +29,5 @@ jobs:
       - name: Reject binary artifacts and validate configuration
         run: |
           test -z "$(git -C config ls-files '*.jar' '*.log' 'world/*' 'world_nether/*' 'world_the_end/*' 'secrets.env' '.env')"
-          cargo run --locked --manifest-path tool/Cargo.toml -- validate --repository "$GITHUB_WORKSPACE/config"
+          cd tool
+          cargo run --locked -- validate --repository "$GITHUB_WORKSPACE/config"

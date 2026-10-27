@@ -32,8 +32,9 @@ jobs:
           persist-credentials: false
       - name: Resolve and validate proposed dependencies
         run: |
-          cargo run --locked --manifest-path tool/Cargo.toml -- update-dependencies --repository "$GITHUB_WORKSPACE/config" > "$RUNNER_TEMP/gitcraft-updates.json"
-          cargo run --locked --manifest-path tool/Cargo.toml -- validate --repository "$GITHUB_WORKSPACE/config"
+          cd tool
+          cargo run --locked -- update-dependencies --repository "$GITHUB_WORKSPACE/config" > "$RUNNER_TEMP/gitcraft-updates.json"
+          cargo run --locked -- validate --repository "$GITHUB_WORKSPACE/config"
       - name: Open reviewable pull request
         working-directory: config
         env:
@@ -49,7 +50,7 @@ jobs:
           git checkout -b "$branch"
           git config user.name 'gitcraft-bot'
           git config user.email 'gitcraft-bot@users.noreply.github.com'
-          git add -- requirements/engine.json requirements/plugins.json requirements/mods.json 2>/dev/null || git add -- requirements/
+          git add --update -- requirements/
           git commit -m 'chore: propose stable compatible dependency updates'
           git -c credential.helper='!gh auth git-credential' push origin "HEAD:refs/heads/$branch"
           {

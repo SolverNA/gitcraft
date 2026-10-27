@@ -49,6 +49,24 @@ if [[ "$dry_run" == true ]]; then
 fi
 if ((EUID != 0)); then printf '%s\n' 'Run installation with sudo; use --dry-run to inspect without privileges.' >&2; exit 2; fi
 if [[ ! -d /run/systemd/system ]]; then printf '%s\n' 'A running systemd host is required.' >&2; exit 2; fi
+reject_symlinks() {
+  local path=$1 current='' part
+  local -a components
+  IFS='/' read -r -a components <<< "$path"
+  for part in "${components[@]}"; do
+    [[ -n "$part" ]] || continue
+    current="$current/$part"
+    if [[ -L "$current" ]]; then printf 'Refusing symlink in installation path: %s\n' "$current" >&2; exit 2; fi
+  done
+}
+# The runtime user owns its data. Never follow its symlinks during a privileged rerun.
+for path in /opt/gitcraft/bin/gitcraft /etc/gitcraft/config/agent.yml /etc/gitcraft/secrets.env /etc/gitcraft/java.env \
+  /var/lib/minecraft/.ssh/id_ed25519 /var/lib/minecraft/.ssh/id_ed25519.pub \
+  /etc/sudoers.d/gitcraft /etc/systemd/system/minecraft.service /etc/systemd/system/gitcraft-agent.service \
+  /etc/systemd/system/gitcraft-agent.timer /etc/systemd/system/gitcraft-web.service; do
+  reject_symlinks "$path"
+done
+for directory in repository server state cache staging backups; do reject_symlinks "/var/lib/minecraft/$directory"; done
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get install -y --no-install-recommends git openssh-client sudo ca-certificates openssl
@@ -113,6 +131,8 @@ if [[ ! -e /etc/gitcraft/secrets.env ]]; then
   chown root:root /etc/gitcraft/secrets.env
   chmod 0600 /etc/gitcraft/secrets.env
 fi
+chown root:root /etc/gitcraft/secrets.env
+chmod 0600 /etc/gitcraft/secrets.env
 if [[ ! -e /etc/gitcraft/java.env ]]; then
   printf '%s\n' 'JAVA_OPTS=-Xms1G -Xmx2G' > /etc/gitcraft/java.env
   chmod 0644 /etc/gitcraft/java.env
@@ -139,6 +159,7 @@ cat /var/lib/minecraft/.ssh/id_ed25519.pub
 printf '%s\n' 'Verify GitHub SSH host fingerprints independently, then populate /var/lib/minecraft/.ssh/known_hosts.' \
   'Web UI: ssh -L 8765:127.0.0.1:8765 USER@HOST; open http://127.0.0.1:8765.' \
   'Read Web UI token locally from /etc/gitcraft/secrets.env (it is not printed).' \
-  'After repository pins are configured, explicitly bootstrap with EULA acceptance; see README.' \
+  'Block external RCON access for IPv4 and IPv6 BEFORE starting Minecraft.' \
+  'After repository pins are configured: sudo scripts/bootstrap-server.sh --accept-eula' \
   'Then: systemctl enable --now minecraft.service gitcraft-agent.timer' \
   'Firewall unchanged. RCON must be blocked on external interfaces; expose Minecraft only as intended.'
