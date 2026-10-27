@@ -31,6 +31,16 @@ sudo bash scripts/install.sh --repository git@github.com:your-team/minecraft-con
 
 **До bootstrap закройте внешний доступ к TCP-порту RCON (по умолчанию 25575) для IPv4 и IPv6.** Loopback-адрес клиента RCON в agent.yml не ограничивает сетевой listener Minecraft. Установщик не меняет firewall или SSH. Доступ к Minecraft, SSH и панели настройте под свою сеть. Bootstrap и таймер не запускаются установщиком автоматически.
 
+## Подготовка GitHub-репозитория
+
+`scripts/bootstrap-repo.sh` использует локальную авторизацию GitHub CLI (`gh auth login`) администратора. Токен не передается агенту Minecraft. Сначала проверьте план:
+
+```sh
+bash scripts/bootstrap-repo.sh --repository your-team/minecraft-config --tool-repository your-team/gitcraft --tool-ref FULL_REVIEWED_40_CHARACTER_COMMIT_SHA --create --dry-run
+```
+
+Замените `FULL_REVIEWED_40_CHARACTER_COMMIT_SHA` реальным SHA опубликованного коммита инструмента. Уберите `--dry-run`, чтобы создать приватный репозиторий и отправить шаблон; для существующего репозитория уберите также `--create`, тогда изменения предлагаются через PR. В репозиторий добавляются Actions проверки и бота обновлений. Правила защиты `main`, обязательные проверки/одобрения и разрешение Actions создавать PR настройте в GitHub отдельно.
+
 ## Конфигурация
 
 Все настройки можно редактировать руками. Пример локального `agent.yml`:
