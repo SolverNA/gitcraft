@@ -28,6 +28,7 @@ jobs:
           persist-credentials: false
       - name: Reject binary artifacts and validate configuration
         run: |
-          test -z "$(git -C config ls-files '*.jar' '*.log' 'world/*' 'world_nether/*' 'world_the_end/*' 'secrets.env' '.env')"
+          # The same Rust policy is used by export, PR creation and deploy staging.
+          # It audits tracked files even if .gitignore would hide them.
           cd tool
           cargo run --locked -- validate --repository "$GITHUB_WORKSPACE/config"

@@ -17,13 +17,23 @@ pub fn validate(mut value: Value) -> Result<Value> {
         "repository":{"branch":"main","poll_interval_seconds":60},
         "deployment":{"service":"minecraft.service","empty_grace_seconds":60,"health_timeout_seconds":120},
         "rcon":{"host":"127.0.0.1","port":25575,"password_env":"MINECRAFT_RCON_PASSWORD","timeout_seconds":5},
-        "web":{"host":"127.0.0.1","port":8765,"token_env":"GITCRAFT_WEB_TOKEN"}
+        "web":{"host":"127.0.0.1","port":8765,"token_env":"GITCRAFT_WEB_TOKEN"},
+        "transfer":{"max_session_bytes":107374182400u64,"max_staging_bytes":214748364800u64,"max_files":100000,"min_free_bytes":1073741824,"session_ttl_seconds":604800}
     });
     let object = value
         .as_object_mut()
         .context("Configuration must be a mapping")?;
     for key in object.keys() {
-        if !["repository", "deployment", "rcon", "web", "paths"].contains(&key.as_str()) {
+        if ![
+            "repository",
+            "deployment",
+            "rcon",
+            "web",
+            "paths",
+            "transfer",
+        ]
+        .contains(&key.as_str())
+        {
             bail!("Unknown configuration section: {key}");
         }
     }
@@ -109,6 +119,11 @@ pub fn validate(mut value: Value) -> Result<Value> {
         ("rcon", "port", 1, 65535),
         ("rcon", "timeout_seconds", 1, 300),
         ("web", "port", 1, 65535),
+        ("transfer", "max_session_bytes", 1, 10995116277760),
+        ("transfer", "max_staging_bytes", 1, 21990232555520),
+        ("transfer", "max_files", 1, 1000000),
+        ("transfer", "min_free_bytes", 1, 1099511627776),
+        ("transfer", "session_ttl_seconds", 1, 2592000),
     ] {
         let number = value[section][key]
             .as_u64()
@@ -116,6 +131,11 @@ pub fn validate(mut value: Value) -> Result<Value> {
         if number < min || number > max {
             bail!("Invalid {section}.{key}");
         }
+    }
+    if value["transfer"]["max_staging_bytes"].as_u64()
+        < value["transfer"]["max_session_bytes"].as_u64()
+    {
+        bail!("Transfer staging quota must cover one session");
     }
     let service = value["deployment"]["service"]
         .as_str()
