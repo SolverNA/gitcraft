@@ -88,7 +88,7 @@ pub(crate) fn restore_stopped(
     let phase = journal["phase"].as_str().context("Missing journal phase")?;
     let mutation_possible = matches!(
         phase,
-        "applying" | "starting" | "healthy" | "committed" | "rolling_back"
+        "applying" | "starting" | "healthy" | "committed" | "rolling_back" | "recovery_required"
     );
     if mutation_possible {
         let backup = Path::new(journal["backup"].as_str().context("Missing backup path")?);

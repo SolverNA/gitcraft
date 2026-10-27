@@ -68,9 +68,19 @@ pub fn safe_path(root: &Path, relative: &str) -> Result<PathBuf> {
     Ok(candidate)
 }
 fn config_extension(path: &Path) -> bool {
-    path.extension()
-        .and_then(|s| s.to_str())
-        .is_some_and(|s| ["yml", "yaml", "properties", "json", "txt", "toml", "conf"].contains(&s))
+    path.extension().and_then(|s| s.to_str()).is_some_and(|s| {
+        [
+            "yml",
+            "yaml",
+            "properties",
+            "json",
+            "txt",
+            "toml",
+            "conf",
+            "cfg",
+        ]
+        .contains(&s)
+    })
 }
 pub(crate) fn collect_configs(
     base: &Path,
@@ -487,6 +497,15 @@ fn run_transaction(
         Ok(())
     })();
     if let Err(error) = applied {
+        if journal["may_have_started"] == true {
+            crate::recovery::phase(config, &mut journal, "recovery_required")?;
+            let stopped = runtime.service("stop", name).is_ok();
+            atomic_json(
+                &state_dir.join("status.json"),
+                &json!({"status":"recovery_required","service_stopped":stopped,"backup":backup,"message":"Java may have changed world/plugin data. Inspect consistent data backups, explicitly recover --acknowledge-data-risk, then decide when to start the existing unit. No automatic downgrade was started."}),
+            )?;
+            return Err(error.context("Java start was attempted; explicit recovery with data-risk acknowledgement is required; no automatic downgrade or restart"));
+        }
         crate::recovery::phase(config, &mut journal, "rolling_back")?;
         let rollback = (|| -> Result<()> {
             runtime.service("stop", name)?;
@@ -541,10 +560,17 @@ fn execute(config: &Value, bootstrap: bool) -> Result<Value> {
     };
     match &result {
         Ok(value) => atomic_json(&state.join("status.json"), value)?,
-        Err(_) => atomic_json(
-            &state.join("status.json"),
-            &json!({"status":"error","message":"Deployment failed; inspect local journal","timestamp":timestamp()}),
-        )?,
+        Err(_) => {
+            let status = if crate::recovery::pending(config)?.is_some() {
+                "recovery_required"
+            } else {
+                "error"
+            };
+            atomic_json(
+                &state.join("status.json"),
+                &json!({"status":status,"message":"Deployment failed; inspect durable journal. Recovery never restarts Minecraft automatically.","timestamp":timestamp()}),
+            )?;
+        }
     }
     FileExt::unlock(&lock)?;
     result
@@ -995,6 +1021,10 @@ mod integration_tests {
             .is_err()
         );
         let server = paths(&fixture.config, "server").unwrap();
+        let journal = crate::recovery::pending(&fixture.config).unwrap().unwrap();
+        assert_eq!(journal["phase"], "recovery_required");
+        assert!(crate::recovery::restore_stopped(&fixture.config, &journal, false).is_err());
+        crate::recovery::restore_stopped(&fixture.config, &journal, true).unwrap();
         assert_eq!(
             fs::read_to_string(server.join("server.jar")).unwrap(),
             "old jar"
@@ -1004,11 +1034,8 @@ mod integration_tests {
             "motd=old\n"
         );
         assert!(server.join("plugins/old.jar").exists());
-        assert_eq!(fixture.runtime.readiness_calls, 2);
-        assert_eq!(
-            fixture.runtime.actions,
-            vec!["stop", "start", "stop", "start"]
-        );
+        assert_eq!(fixture.runtime.readiness_calls, 1);
+        assert_eq!(fixture.runtime.actions, vec!["stop", "start", "stop"]);
         let state: Value = serde_json::from_slice(
             &fs::read(fixture.runtime.state.join("deployment.json")).unwrap(),
         )
