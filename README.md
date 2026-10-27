@@ -18,6 +18,19 @@ cargo clippy --all-targets --locked -- -D warnings
 
 На сервере Python не требуется. Используется один бинарник `gitcraft` и shell-установщик. Rust toolchain требуется только при сборке из исходников.
 
+## Установка
+
+Сначала соберите и проверьте бинарник. План установки можно посмотреть без root:
+
+```sh
+bash scripts/install.sh --repository git@github.com:your-team/minecraft-config.git --dry-run
+sudo bash scripts/install.sh --repository git@github.com:your-team/minecraft-config.git --binary ./target/release/gitcraft
+```
+
+Установщик поддерживает Debian/Ubuntu с работающим systemd, сохраняет существующие конфиги, создает read-only SSH deploy key и запускает локальную панель. Зарегистрируйте публичный ключ в GitHub без write-доступа и независимо проверьте SSH host key GitHub. Автоматическое доверие через `ssh-keyscan` не применяется.
+
+**До bootstrap закройте внешний доступ к TCP-порту RCON (по умолчанию 25575) для IPv4 и IPv6.** Loopback-адрес клиента RCON в agent.yml не ограничивает сетевой listener Minecraft. Установщик не меняет firewall или SSH. Доступ к Minecraft, SSH и панели настройте под свою сеть. Bootstrap и таймер не запускаются установщиком автоматически.
+
 ## Конфигурация
 
 Все настройки можно редактировать руками. Пример локального `agent.yml`:
@@ -28,12 +41,12 @@ repository:
   branch: main
   poll_interval_seconds: 60
 paths:
-  repository: /var/lib/gitcraft/repository
+  repository: /var/lib/minecraft/repository
   server: /var/lib/minecraft/server
-  state: /var/lib/gitcraft/state
-  cache: /var/lib/gitcraft/cache
-  staging: /var/lib/gitcraft/staging
-  backups: /var/backups/gitcraft
+  state: /var/lib/minecraft/state
+  cache: /var/lib/minecraft/cache
+  staging: /var/lib/minecraft/staging
+  backups: /var/lib/minecraft/backups
 deployment:
   service: minecraft.service
   empty_grace_seconds: 60
