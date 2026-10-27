@@ -157,7 +157,7 @@ pub(crate) fn collect_configs(
     }
     Ok(())
 }
-fn service(action: &str, name: &str) -> Result<Output> {
+pub(crate) fn service(action: &str, name: &str) -> Result<Output> {
     if !name.ends_with(".service")
         || !name
             .chars()
@@ -202,7 +202,11 @@ fn copy_atomic(source: &Path, dest: &Path) -> Result<()> {
     File::open(parent)?.sync_all()?;
     Ok(())
 }
-fn write_properties(source: Option<&Path>, dest: &Path, client: &RconClient) -> Result<()> {
+pub(crate) fn write_properties(
+    source: Option<&Path>,
+    dest: &Path,
+    client: &RconClient,
+) -> Result<()> {
     if client
         .password
         .chars()
@@ -260,6 +264,9 @@ fn write_properties(source: Option<&Path>, dest: &Path, client: &RconClient) -> 
     Ok(())
 }
 pub(crate) trait Runtime {
+    fn launcher(&mut self, config: &Value) -> Result<Value> {
+        crate::adopt::show_unit(config)
+    }
     fn checkpoint(&mut self, _phase: &str) -> Result<()> {
         Ok(())
     }
@@ -309,8 +316,7 @@ fn paths(config: &Value, key: &str) -> Result<PathBuf> {
     Ok(PathBuf::from(text(config, "paths", key)?))
 }
 pub(crate) fn client(config: &Value) -> Result<RconClient> {
-    let env = text(config, "rcon", "password_env")?;
-    let password = std::env::var(env).context("RCON secret environment variable missing")?;
+    let password = crate::secrets::resolve(config, "rcon")?;
     if password.is_empty() {
         bail!("RCON password cannot be empty");
     }
@@ -380,9 +386,6 @@ pub(crate) fn run_transaction(
         &paths(config, "repository")?,
         &paths(config, "staging")?,
     )?;
-    if state["commit"].as_str() == Some(&commit) {
-        return Ok(json!({"status":"unchanged","commit":commit}));
-    }
     crate::policy::validate_repository(&repo)?;
     let mut sources = BTreeMap::new();
     for (folder, prefix, top) in [
@@ -397,6 +400,14 @@ pub(crate) fn run_transaction(
     let manifest = artifacts::load_manifest(&repo)?;
     if !manifest.iter().any(|a| !a.destination.contains('/')) {
         bail!("An engine manifest is required");
+    }
+    let engine = manifest
+        .iter()
+        .find(|a| !a.destination.contains('/'))
+        .context("Engine pin missing")?;
+    crate::adopt::verify_launcher(config, &runtime.launcher(config)?, &engine.destination)?;
+    if state["commit"].as_str() == Some(&commit) {
+        return Ok(json!({"status":"unchanged","commit":commit}));
     }
     for artifact in &manifest {
         let cached = runtime.download(artifact, &paths(config, "cache")?)?;
@@ -435,6 +446,7 @@ pub(crate) fn run_transaction(
     {
         return Ok(json!({"status":"waiting_for_players","commit":commit}));
     }
+    crate::adopt::verify_launcher(config, &runtime.launcher(config)?, &engine.destination)?;
     // Journal is durable before stop or any managed mutation; recovery never touches worlds.
     let backup = backup_root.join(format!("{commit}-{}", timestamp()));
     fs::create_dir_all(&backup)?;
@@ -673,7 +685,7 @@ mod tests {
     }
 }
 
-fn wait_empty(mut online: impl FnMut() -> Result<u32>, grace: Duration) -> Result<bool> {
+pub(crate) fn wait_empty(mut online: impl FnMut() -> Result<u32>, grace: Duration) -> Result<bool> {
     if online()? != 0 {
         return Ok(false);
     }
@@ -770,12 +782,29 @@ mod integration_tests {
         commit: String,
         online: Option<u32>,
         actions: Vec<String>,
+        active: bool,
+        launcher_target: String,
+        launcher_calls: usize,
+        change_launcher_after_first: Option<String>,
         crash_after: Option<String>,
         fail_first_readiness: bool,
         readiness_calls: usize,
         state: PathBuf,
     }
     impl Runtime for FakeRuntime {
+        fn launcher(&mut self, config: &Value) -> Result<Value> {
+            self.launcher_calls += 1;
+            let target = if self.launcher_calls > 1 {
+                self.change_launcher_after_first
+                    .as_deref()
+                    .unwrap_or(&self.launcher_target)
+            } else {
+                &self.launcher_target
+            };
+            Ok(
+                json!({"Id":config["deployment"]["service"],"WorkingDirectory":config["paths"]["server"],"ExecStart":format!("{{ path=/usr/bin/java ; argv[]=/usr/bin/java -jar {target} nogui ; }}"),"LaunchPath":"/usr/bin/java","LaunchArgv":["/usr/bin/java","-jar",target,"nogui"],"LaunchFlags":[]}),
+            )
+        }
         fn checkpoint(&mut self, phase: &str) -> Result<()> {
             if self.crash_after.as_deref() == Some(phase) {
                 panic!("simulated process interruption at {phase}");
@@ -790,9 +819,24 @@ mod integration_tests {
         }
         fn service(&mut self, action: &str, _: &str) -> Result<Output> {
             self.actions.push(action.into());
+            if action == "stop" {
+                self.active = false;
+            } else if action == "start" {
+                self.active = true;
+            }
             Ok(Output {
-                status: std::process::ExitStatus::from_raw(0),
-                stdout: b"active\n".to_vec(),
+                status: std::process::ExitStatus::from_raw(
+                    if action == "is-active" && !self.active {
+                        3 << 8
+                    } else {
+                        0
+                    },
+                ),
+                stdout: if self.active {
+                    b"active\n".to_vec()
+                } else {
+                    b"inactive\n".to_vec()
+                },
                 stderr: vec![],
             })
         }
@@ -926,6 +970,10 @@ mod integration_tests {
                     commit,
                     online: Some(0),
                     actions: vec![],
+                    active: true,
+                    launcher_target: "server.jar".into(),
+                    launcher_calls: 0,
+                    change_launcher_after_first: None,
                     crash_after: None,
                     fail_first_readiness: false,
                     readiness_calls: 0,
@@ -935,6 +983,112 @@ mod integration_tests {
         }
     }
     use sha2::Digest;
+    #[test]
+    fn adopted_engine_rename_rejected_before_stop() {
+        let mut fixture = Fixture::new();
+        let manifest = fixture.runtime.repo.join("requirements/engine.json");
+        let mut value: Value = serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
+        value["filename"] = json!("renamed.jar");
+        fs::write(manifest, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(&fixture.runtime.repo)
+                .args([
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.org",
+                    "commit",
+                    "--quiet",
+                    "-am",
+                    "rename engine"
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            run_transaction(
+                &fixture.config,
+                false,
+                &fixture.client,
+                &mut fixture.runtime
+            )
+            .is_err()
+        );
+        assert!(fixture.runtime.active);
+        assert!(!fixture.runtime.actions.iter().any(|a| a == "stop"));
+        assert!(
+            !paths(&fixture.config, "server")
+                .unwrap()
+                .join("renamed.jar")
+                .exists()
+        );
+        assert_eq!(
+            fs::read_to_string(paths(&fixture.config, "server").unwrap().join("server.jar"))
+                .unwrap(),
+            "old jar"
+        );
+    }
+    #[test]
+    fn fresh_bootstrap_launcher_mismatch_rejected_before_apply() {
+        let mut fixture = Fixture::new();
+        fs::remove_file(fixture.runtime.state.join("deployment.json")).unwrap();
+        fixture.runtime.active = false;
+        fixture.runtime.launcher_target = "different.jar".into();
+        assert!(
+            run_transaction(&fixture.config, true, &fixture.client, &mut fixture.runtime).is_err()
+        );
+        assert!(
+            !fixture
+                .runtime
+                .actions
+                .iter()
+                .any(|a| a == "start" || a == "stop")
+        );
+        assert!(
+            !fs::read_to_string(paths(&fixture.config, "server").unwrap().join("eula.txt"))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            fs::read_to_string(paths(&fixture.config, "server").unwrap().join("server.jar"))
+                .unwrap(),
+            "old jar"
+        );
+    }
+    #[test]
+    fn unchanged_commit_still_checks_launcher_and_second_check_catches_changes() {
+        let mut fixture = Fixture::new();
+        let state = fixture.runtime.state.join("deployment.json");
+        let mut value: Value = serde_json::from_slice(&fs::read(&state).unwrap()).unwrap();
+        value["commit"] = json!(fixture.runtime.commit);
+        atomic_json(&state, &value).unwrap();
+        fixture.runtime.launcher_target = "other.jar".into();
+        assert!(
+            run_transaction(
+                &fixture.config,
+                false,
+                &fixture.client,
+                &mut fixture.runtime
+            )
+            .is_err()
+        );
+        assert!(fixture.runtime.actions.is_empty());
+        let mut fixture = Fixture::new();
+        fixture.runtime.change_launcher_after_first = Some("changed.jar".into());
+        assert!(
+            run_transaction(
+                &fixture.config,
+                false,
+                &fixture.client,
+                &mut fixture.runtime
+            )
+            .is_err()
+        );
+        assert!(fixture.runtime.actions.is_empty());
+    }
     #[test]
     fn durable_journal_recovers_every_interruption_phase_without_restarting() {
         for phase in [

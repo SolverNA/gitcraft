@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, fs, path::Path, process::Command, time::Duration};
-fn show_unit(config: &Value) -> Result<Value> {
+pub(crate) fn show_unit(config: &Value) -> Result<Value> {
     let name = config["deployment"]["service"]
         .as_str()
         .context("Service required")?;
@@ -20,7 +20,65 @@ fn show_unit(config: &Value) -> Result<Value> {
     if !output.status.success() {
         bail!("Cannot discover existing unit");
     }
-    parse_show(&String::from_utf8(output.stdout)?)
+    let mut unit = parse_show(&String::from_utf8(output.stdout)?)?;
+    let object = bus_json(&[
+        "call",
+        "org.freedesktop.systemd1",
+        "/org/freedesktop/systemd1",
+        "org.freedesktop.systemd1.Manager",
+        "GetUnit",
+        "s",
+        name,
+    ])?;
+    let object = object["data"][0]
+        .as_str()
+        .context("Cannot resolve structured systemd unit")?;
+    let commands = bus_json(&[
+        "get-property",
+        "org.freedesktop.systemd1",
+        object,
+        "org.freedesktop.systemd1.Service",
+        "ExecStartEx",
+    ])?;
+    attach_structured_launcher(&mut unit, &commands)?;
+    Ok(unit)
+}
+fn attach_structured_launcher(unit: &mut Value, commands: &Value) -> Result<()> {
+    if commands["type"] != "a(sasasttttuii)" {
+        bail!("Unsupported structured ExecStartEx signature; no fallback to ambiguous text");
+    }
+    let records = commands["data"]
+        .as_array()
+        .context("Structured launcher unavailable; explicit direct Java launch required")?;
+    if records.len() != 1 {
+        bail!("Exactly one structured ExecStart is required");
+    }
+    let record = records[0]
+        .as_array()
+        .context("Malformed structured launcher")?;
+    if record.len() != 10 {
+        bail!("Malformed structured ExecStartEx record");
+    }
+    unit["LaunchPath"] = record[0].clone();
+    unit["LaunchArgv"] = record[1].clone();
+    unit["LaunchFlags"] = record[2].clone();
+    Ok(())
+}
+
+fn bus_json(args: &[&str]) -> Result<Value> {
+    let output = gitrepo::run_bounded(
+        Command::new("/usr/bin/busctl")
+            .args(["--system", "--json=short"])
+            .args(args),
+        Duration::from_secs(30),
+    ).context("busctl discovery unavailable; install a supported systemd/busctl package; deployment was not applied")?;
+    if !output.status.success() {
+        bail!(
+            "Structured systemd launcher discovery failed; supported system bus and ExecStartEx are required; no deployment was applied"
+        );
+    }
+    serde_json::from_slice(&output.stdout)
+        .map_err(|_| anyhow::anyhow!("Malformed structured systemd response; values omitted"))
 }
 fn parse_show(output: &str) -> Result<Value> {
     let mut props = serde_json::Map::new();
@@ -58,44 +116,113 @@ fn stable_unit(unit: &Value) -> Value {
     unit
 }
 fn launch_engine(server: &Path, unit: &Value) -> Result<String> {
-    let exec = unit["ExecStart"].as_str().context("ExecStart required")?;
-    let executable = exec
-        .split("path=")
-        .nth(1)
-        .and_then(|s| s.split(" ;").next())
-        .context("Cannot resolve executable from systemd")?;
-    if Path::new(executable).file_name().and_then(|s| s.to_str()) != Some("java") {
+    launch_engine_path(server, unit, true)
+}
+fn launch_engine_path(server: &Path, unit: &Value, require_existing: bool) -> Result<String> {
+    let executable = unit["LaunchPath"]
+        .as_str()
+        .context("Exact structured launcher path is required")?;
+    if !Path::new(executable).is_absolute()
+        || Path::new(executable).file_name().and_then(|s| s.to_str()) != Some("java")
+    {
         bail!(
-            "Unsupported launcher: adoption currently requires direct java -jar; shell scripts and Forge @args need a reviewed launcher adapter"
+            "Unsupported launcher: direct absolute java -jar required; shell/Forge @args launchers are not inferred"
         );
     }
-    let args = exec
-        .split("argv[]=")
-        .nth(1)
-        .and_then(|s| s.split(" ;").next())
-        .context("Cannot resolve launch arguments")?;
-    let words: Vec<_> = args.split_whitespace().collect();
-    let jar=words.windows(2).find(|w|w[0]=="-jar").map(|w|w[1]).context("Unsupported launcher: direct -jar is required; @args and shell launchers are not inferred")?;
+    if !unit["LaunchFlags"]
+        .as_array()
+        .is_some_and(|flags| flags.is_empty())
+    {
+        bail!(
+            "Prefixed systemd executable flags are unsupported; review an explicit unprefixed Java launch"
+        );
+    }
+    let values = unit["LaunchArgv"]
+        .as_array()
+        .context("Exact structured launcher argv required")?;
+    let words: Vec<&str> = values
+        .iter()
+        .map(|v| v.as_str().context("Malformed launcher argv"))
+        .collect::<Result<_>>()?;
+    if words.first().copied() != Some(executable)
+        || words
+            .iter()
+            .any(|w| w.starts_with('@') || w.contains(['$', '%', '\\', '\'', '"']))
+        || words.iter().filter(|w| **w == "-jar").count() != 1
+    {
+        bail!(
+            "Ambiguous launcher substitutions, escaped arguments or argument files unsupported; use reviewed explicit Java flags and one -jar target"
+        );
+    }
+    let jar = words
+        .windows(2)
+        .find(|w| w[0] == "-jar")
+        .map(|w| w[1])
+        .context("Unsupported launcher: direct -jar required")?;
     let jar_path = Path::new(jar);
-    let full = if jar_path.is_absolute() {
-        jar_path.to_path_buf()
-    } else {
-        server.join(jar_path)
-    };
-    let canonical = fs::canonicalize(&full).context("Launched JAR does not exist")?;
     let server = fs::canonicalize(server)?;
-    let relative = canonical
-        .strip_prefix(&server)
-        .context("Launched JAR is outside server directory")?;
-    if relative.components().count() != 1 {
-        bail!("Launched engine must be a top-level pinned JAR");
+    let relative = if jar_path.is_absolute() {
+        jar_path
+            .strip_prefix(&server)
+            .context("Launched JAR is outside server directory")?
+            .to_path_buf()
+    } else {
+        jar_path.to_path_buf()
+    };
+    let mut components = relative.components();
+    let first = components.next().context("Missing engine filename")?;
+    let filename = match first {
+        std::path::Component::CurDir => components.next(),
+        std::path::Component::Normal(_) => Some(first),
+        _ => None,
     }
-    let relative = relative.to_str().context("Non-UTF8 launched JAR")?;
-    deploy::safe_path(&server, relative)?;
-    if fs::symlink_metadata(&full)?.file_type().is_symlink() {
-        bail!("Launched engine symlink is unsupported");
+    .context("Unsafe engine path")?;
+    if components.next().is_some() {
+        bail!("Engine must be a top-level JAR without parent traversal");
     }
-    Ok(relative.into())
+    let filename = filename
+        .as_os_str()
+        .to_str()
+        .context("Non-UTF8 engine filename")?;
+    if !filename.ends_with(".jar")
+        || !filename
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c))
+        || !filename
+            .bytes()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric())
+    {
+        bail!("Ambiguous or escaped engine filename is unsupported");
+    }
+    let target = deploy::safe_path(&server, filename)?;
+    if require_existing && !target.is_file() {
+        bail!("Launched JAR does not exist");
+    }
+    Ok(filename.into())
+}
+/// Validate the effective launcher without rewriting it or requiring a bootstrap JAR to exist.
+pub(crate) fn verify_launcher(config: &Value, unit: &Value, destination: &str) -> Result<()> {
+    if unit["Id"] != config["deployment"]["service"] {
+        bail!("Discovered unit identity differs from configured service");
+    }
+    let server = Path::new(
+        config["paths"]["server"]
+            .as_str()
+            .context("Server path required")?,
+    );
+    let working = unit["WorkingDirectory"]
+        .as_str()
+        .context("Unit WorkingDirectory required")?;
+    if fs::canonicalize(working)? != fs::canonicalize(server)? {
+        bail!("Unit WorkingDirectory differs from configured server");
+    }
+    if launch_engine_path(server, unit, false)? != destination {
+        bail!(
+            "Pinned engine destination differs from actual systemd -jar target; unit was not rewritten and deployment was not applied"
+        );
+    }
+    Ok(())
 }
 fn build_plan(config: &Value, server: &Path, unit: &Value) -> Result<Value> {
     deploy::safe_path(server, "server.properties")?;
@@ -129,6 +256,7 @@ fn build_plan(config: &Value, server: &Path, unit: &Value) -> Result<Value> {
     };
     let mut display = stable.clone();
     display["ExecStart"] = json!("[redacted: exact effective command is fingerprinted]");
+    display["LaunchArgv"] = json!("[redacted: exact arguments are fingerprinted]");
     Ok(
         json!({"kind":"adopt-plan-v1","server":server,"service":config["deployment"]["service"],"unit":display,"unit_sha256":fingerprint(&stable)?,"exec_start_sha256":format!("{:x}",Sha256::digest(exec.as_bytes())),"discovered_executable":executable,"launch_supported":supported,"engine_filename":engine,"unsupported_reason":reason,"active_state":unit["ActiveState"],"actions":["verify approved repository commit and runtime hashes","verify existing RCON credentials without resetting","seed initial managed ownership and verified local artifact receipts"],"preserves":["existing systemd unit","launch command and Java","worlds and plugin databases","existing RCON credentials"],"requires_review":true}),
     )
@@ -336,11 +464,13 @@ mod tests {
             "[Service]\nUser=custom\nExecStart=/custom/java -Xmx7G -jar custom-paper.jar\n";
         fs::write(&fragment, contents).unwrap();
         let config = json!({"paths":{"server":server,"state":state,"cache":root.path().join("cache")},"deployment":{"service":"custom.service"}});
-        let unit = json!({"Id":"custom.service","User":"custom","Group":"custom","WorkingDirectory":server,"ExecStart":"{ path=/custom/java ; argv[]=/custom/java -Xmx7G -jar custom-paper.jar ; }","FragmentPath":fragment,"ActiveState":"active","MainPID":"123"});
+        let unit = json!({"Id":"custom.service","User":"custom","Group":"custom","WorkingDirectory":server,"ExecStart":"{ path=/custom/java ; argv[]=/custom/java -Xmx7G -jar custom-paper.jar ; }","FragmentPath":fragment,"ActiveState":"active","MainPID":"123","LaunchPath":"/custom/java","LaunchArgv":["/custom/java","-Xmx7G","-jar","custom-paper.jar"],"LaunchFlags":[]});
         let plan = build_plan(&config, &server, &unit).unwrap();
         assert!(plan["launch_supported"].as_bool().unwrap());
         assert!(!serde_json::to_string(&plan).unwrap().contains("-Xmx7G"));
         let mut unsupported = unit.clone();
+        unsupported["LaunchPath"] = json!("/bin/sh");
+        unsupported["LaunchArgv"] = json!(["/bin/sh", "launch.sh", "--password=hidden"]);
         unsupported["ExecStart"] =
             json!("{ path=/bin/sh ; argv[]=/bin/sh launch.sh --password=hidden ; }");
         let preview = build_plan(&config, &server, &unsupported).unwrap();
@@ -400,5 +530,47 @@ mod tests {
                 .contains("existing-secret")
         );
         assert!(server.join("custom-paper.jar").exists());
+    }
+}
+
+#[cfg(test)]
+mod launcher_tests {
+    use super::*;
+    #[test]
+    fn exact_dbus_argv_flags_and_missing_bootstrap_jar() {
+        let root = tempfile::tempdir().unwrap();
+        let config =
+            json!({"paths":{"server":root.path()},"deployment":{"service":"minecraft.service"}});
+        let mut unit = json!({"Id":"minecraft.service","WorkingDirectory":root.path()});
+        let record = json!([
+            "/usr/bin/java",
+            ["/usr/bin/java", "-Xmx2G", "-jar", "server.jar", "nogui"],
+            [],
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+        ]);
+        let structured = json!({"type":"a(sasasttttuii)","data":[record.clone()]});
+        attach_structured_launcher(&mut unit, &structured).unwrap();
+        assert!(verify_launcher(&config, &unit, "server.jar").is_ok());
+        assert!(verify_launcher(&config, &unit, "other.jar").is_err());
+        unit["LaunchArgv"] = json!(["/usr/bin/java", "-jar", "server.jar nogui"]);
+        assert!(verify_launcher(&config, &unit, "server.jar").is_err());
+        unit["LaunchArgv"] = json!(["/usr/bin/java", "$JAVA_OPTS", "-jar", "server.jar"]);
+        assert!(verify_launcher(&config, &unit, "server.jar").is_err());
+        unit["LaunchArgv"] = json!(["/usr/bin/java", "-jar", "server.jar"]);
+        unit["LaunchFlags"] = json!(["fully-privileged"]);
+        assert!(verify_launcher(&config, &unit, "server.jar").is_err());
+        assert!(
+            attach_structured_launcher(
+                &mut unit,
+                &json!({"type":"a(sasasttttuii)","data":[record.clone(),record]})
+            )
+            .is_err()
+        );
     }
 }
