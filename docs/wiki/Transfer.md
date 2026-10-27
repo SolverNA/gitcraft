@@ -58,7 +58,7 @@ gitcraft transfer verify --endpoint http://127.0.0.1:8765 --session /tmp/world-s
 
 ## Применить отдельно
 
-Целевой Minecraft должен быть остановлен. Для миров всегда требуется явное подтверждение замены, включая миграцию на пустой VPS:
+Целевой Minecraft должен быть остановлен. Каталоги `paths.server` и `paths.backups` должны находиться на одной файловой системе: текущий world commit сохраняет старый каталог через atomic rename (fresh installer размещает их в `/var/lib/minecraft`). При EXDEV сервер остается остановленным, сохраненный journal требует explicit recover; cross-filesystem copy-backup автоматически не выполняется. Для миров всегда требуется явное подтверждение замены, включая миграцию на пустой VPS:
 
 ```sh
 gitcraft transfer commit --endpoint http://127.0.0.1:8765 \
