@@ -16,3 +16,6 @@ pub mod policy;
 pub mod export;
 
 pub mod repository;
+
+#[cfg(test)]
+mod e2e;
