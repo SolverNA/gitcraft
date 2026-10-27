@@ -71,6 +71,12 @@ fn atom(path: &Path, value: &impl Serialize) -> Result<()> {
     serde_json::to_writer_pretty(&mut t, value)?;
     t.as_file().sync_all()?;
     t.persist(path)?;
+    File::open(
+        path.parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new(".")),
+    )?
+    .sync_all()?;
     Ok(())
 }
 fn root(config: &Value) -> Result<PathBuf> {
@@ -87,7 +93,13 @@ fn session_dir(config: &Value, id: &str) -> Result<PathBuf> {
     ensure!(valid_hash(id), "invalid transfer ID");
     crate::deploy::safe_path(&root(config)?, id)
 }
-fn lock(path: &Path) -> Result<File> {
+struct LockGuard(File);
+impl Drop for LockGuard {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.0);
+    }
+}
+fn lock(path: &Path) -> Result<LockGuard> {
     let f = OpenOptions::new()
         .write(true)
         .create(true)
@@ -95,9 +107,19 @@ fn lock(path: &Path) -> Result<File> {
         .open(path)?;
     f.try_lock_exclusive()
         .context("transfer operation already running")?;
-    Ok(f)
+    // Explicit unlock on scope exit: a parallel fork can transiently inherit the
+    // same open-file description until exec, so close alone need not release it.
+    Ok(LockGuard(f))
 }
 fn load(config: &Value, id: &str, token: &str) -> Result<(PathBuf, Session)> {
+    load_inner(config, id, token, false)
+}
+fn load_inner(
+    config: &Value,
+    id: &str,
+    token: &str,
+    allow_expired: bool,
+) -> Result<(PathBuf, Session)> {
     let dir = session_dir(config, id)?;
     let s: Session =
         serde_json::from_slice(&fs::read(crate::deploy::safe_path(&dir, "session.json")?)?)?;
@@ -106,7 +128,8 @@ fn load(config: &Value, id: &str, token: &str) -> Result<(PathBuf, Session)> {
         "invalid scoped transfer token"
     );
     ensure!(
-        now().saturating_sub(s.created) <= limit(config, "session_ttl_seconds", 604800),
+        allow_expired
+            || now().saturating_sub(s.created) <= limit(config, "session_ttl_seconds", 604800),
         "transfer session expired"
     );
     Ok((dir, s))
@@ -116,6 +139,34 @@ fn data(dir: &Path, index: usize) -> Result<PathBuf> {
 }
 fn save(dir: &Path, s: &Session) -> Result<()> {
     atom(&dir.join("session.json"), s)
+}
+pub fn has_pending(config: &Value) -> Result<bool> {
+    for entry in fs::read_dir(root(config)?)? {
+        let dir = entry?.path();
+        if dir.is_symlink() {
+            bail!("transfer session symlink forbidden");
+        }
+        if dir.is_dir() && dir.join("journal.json").exists() {
+            let s: Session = serde_json::from_slice(&fs::read(dir.join("session.json"))?)?;
+            if s.status != "committed" {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+fn sync_tree(path: &Path) -> Result<()> {
+    for entry in fs::read_dir(path)? {
+        let path = entry?.path();
+        ensure!(!path.is_symlink(), "world tree symlink forbidden");
+        if path.is_dir() {
+            sync_tree(&path)?;
+        } else {
+            File::open(path)?.sync_all()?;
+        }
+    }
+    File::open(path)?.sync_all()?;
+    Ok(())
 }
 fn plain_component(value: &str) -> bool {
     !value.is_empty()
@@ -141,9 +192,6 @@ fn validate_file(f: &TransferFile) -> Result<()> {
                 parts.len() == 1 && plain_component(&f.path) && f.path.ends_with(".jar"),
                 "artifact must be a JAR basename"
             );
-            if f.kind == "engine" {
-                ensure!(f.path == "server.jar", "engine must be server.jar");
-            }
         }
         "world" => {
             let first = parts[0]
@@ -163,6 +211,7 @@ fn validate_file(f: &TransferFile) -> Result<()> {
                     "libraries",
                     "state",
                     "config",
+                    "defaultconfigs",
                     "backups",
                     "repository"
                 ]
@@ -288,7 +337,7 @@ pub fn chunk(
     let f = s.manifest.files.get(index).context("unknown file index")?;
     let current = s.offsets[index];
     ensure!(
-        offset % (CHUNK_BYTES as u64) == 0,
+        offset.is_multiple_of(CHUNK_BYTES as u64),
         "chunk offset must be aligned"
     );
     let end = offset
@@ -361,7 +410,7 @@ pub fn commit(config: &Value, id: &str, token: &str, confirm_replace: bool) -> R
         crate::deploy::ensure_stopped(config)
     })
 }
-fn commit_with(
+pub(crate) fn commit_with(
     config: &Value,
     id: &str,
     token: &str,
@@ -382,6 +431,10 @@ fn commit_with(
     );
     let state = Path::new(config["paths"]["state"].as_str().context("state missing")?);
     let _deploy = lock(&crate::deploy::safe_path(state, "deploy.lock")?)?;
+    ensure!(
+        crate::recovery::pending(config)?.is_none(),
+        "deployment recovery is pending; recover it before world transfer commit"
+    );
     stopped()?;
     let server = Path::new(
         config["paths"]["server"]
@@ -420,23 +473,44 @@ fn commit_with(
     }
     let stage = crate::deploy::safe_path(server, &format!("gitcraft-transfer-{id}"))?;
     ensure!(!stage.exists(), "world staging directory already exists");
+    let world_bytes = s
+        .manifest
+        .files
+        .iter()
+        .filter(|f| f.kind == "world")
+        .try_fold(0u64, |n, f| {
+            n.checked_add(f.size).context("world size overflow")
+        })?;
+    ensure!(
+        fs2::available_space(server)?
+            >= world_bytes.saturating_add(limit(config, "min_free_bytes", 1024 * 1024 * 1024)),
+        "insufficient world staging disk space"
+    );
     fs::create_dir(&stage)?;
     let backup = crate::deploy::safe_path(backups, &format!("world-transfer-{id}"))?;
     fs::create_dir_all(&backup)?;
     let mut receipts = Vec::new();
-    for (i, f) in s.manifest.files.iter().enumerate() {
-        if f.kind == "world" {
-            let dest = crate::deploy::safe_path(&stage, &f.path)?;
-            fs::create_dir_all(dest.parent().unwrap())?;
-            fs::copy(data(&dir, i)?, &dest)?;
-            File::open(dest)?.sync_all()?;
-        } else {
-            receipts.push(crate::artifacts::import_local(
-                &data(&dir, i)?,
-                cache,
-                &f.sha256,
-            )?);
+    let preparation = (|| -> Result<()> {
+        for (i, f) in s.manifest.files.iter().enumerate() {
+            if f.kind == "world" {
+                let dest = crate::deploy::safe_path(&stage, &f.path)?;
+                fs::create_dir_all(dest.parent().unwrap())?;
+                fs::copy(data(&dir, i)?, &dest)?;
+                File::open(dest)?.sync_all()?;
+            } else {
+                receipts.push(crate::artifacts::import_local(
+                    &data(&dir, i)?,
+                    cache,
+                    &f.sha256,
+                )?);
+            }
         }
+        sync_tree(&stage)?;
+        Ok(())
+    })();
+    if let Err(error) = preparation {
+        let _ = fs::remove_dir_all(&stage);
+        return Err(error.context("transfer preparation failed before world mutation"));
     }
     for world in &worlds {
         let dest = crate::deploy::safe_path(server, world)?;
@@ -450,7 +524,9 @@ fn commit_with(
         .filter(|w| server.join(w).exists())
         .cloned()
         .collect();
-    let mut journal = json!({"phase":"prepared","worlds":worlds,"existing":existing,"backup":backup,"stage":stage});
+    File::open(server)?.sync_all()?;
+    File::open(backups)?.sync_all()?;
+    let mut journal = json!({"phase":"prepared","worlds":worlds,"existing":existing,"backup":backup,"stage":stage,"artifacts":receipts});
     atom(&dir.join("journal.json"), &journal)?;
     stopped()?;
     let applied = (|| -> Result<()> {
@@ -458,8 +534,12 @@ fn commit_with(
             let dest = crate::deploy::safe_path(server, world)?;
             if dest.exists() {
                 fs::rename(&dest, crate::deploy::safe_path(&backup, world)?)?;
+                File::open(server)?.sync_all()?;
+                File::open(&backup)?.sync_all()?;
             }
             fs::rename(crate::deploy::safe_path(&stage, world)?, &dest)?;
+            File::open(&stage)?.sync_all()?;
+            File::open(server)?.sync_all()?;
         }
         stopped()?;
         Ok(())
@@ -484,14 +564,22 @@ fn commit_with(
 pub fn recover(config: &Value, id: &str, token: &str) -> Result<Value> {
     let dir = session_dir(config, id)?;
     let _session = lock(&dir.join("session.lock"))?;
-    let (_, mut s) = load(config, id, token)?;
+    // Recovery credentials remain valid for an interrupted journal even after upload TTL.
+    let (_, mut s) = load_inner(config, id, token, true)?;
     let state = Path::new(config["paths"]["state"].as_str().context("state missing")?);
     let _deploy = lock(&state.join("deploy.lock"))?;
     crate::deploy::ensure_stopped(config)?;
     let journal: Value = serde_json::from_slice(&fs::read(dir.join("journal.json"))?)?;
+    if journal["phase"] == "committed" {
+        let receipt = json!({"worlds":journal["worlds"],"backup":journal["backup"],"artifacts":journal["artifacts"],"files":s.manifest.files,"committed":now()});
+        atom(&dir.join("receipt.json"), &receipt)?;
+        s.status = "committed".into();
+        save(&dir, &s)?;
+        return Ok(json!({"id":id,"status":"committed","minecraft_restarted":false}));
+    }
     ensure!(
         journal["phase"] == "prepared",
-        "only interrupted commits can be recovered"
+        "unknown transfer recovery phase"
     );
     let server = Path::new(
         config["paths"]["server"]
@@ -506,6 +594,7 @@ pub fn recover(config: &Value, id: &str, token: &str) -> Result<Value> {
     .join(format!("world-transfer-{id}"));
     let existing: BTreeSet<String> = serde_json::from_value(journal["existing"].clone())?;
     let worlds: BTreeSet<String> = serde_json::from_value(journal["worlds"].clone())?;
+    // Preserve backups while recovery is incomplete; repeated recovery is safe.
     for world in worlds {
         ensure!(plain_component(&world), "invalid recovery world");
         let dest = crate::deploy::safe_path(server, &world)?;
@@ -514,19 +603,43 @@ pub fn recover(config: &Value, id: &str, token: &str) -> Result<Value> {
             if dest.exists() {
                 fs::remove_dir_all(&dest)?;
             }
-            fs::rename(old, dest)?;
+            copy_tree(&old, &dest)?;
+            File::open(server)?.sync_all()?;
         } else if !existing.contains(&world) && dest.exists() {
             fs::remove_dir_all(dest)?;
         }
     }
-    fs::remove_file(dir.join("journal.json"))?;
     let stage = crate::deploy::safe_path(server, &format!("gitcraft-transfer-{id}"))?;
     if stage.exists() {
         fs::remove_dir_all(stage)?;
     }
+    if backup.exists() {
+        let archive = backup.with_file_name(format!("recovered-world-transfer-{id}-{}", random()));
+        fs::rename(&backup, &archive)?;
+        File::open(archive.parent().context("archive parent")?)?.sync_all()?;
+    }
     s.status = "verified".into();
     save(&dir, &s)?;
+    fs::remove_file(dir.join("journal.json"))?;
+    File::open(&dir)?.sync_all()?;
     Ok(json!({"id":id,"status":"restored","minecraft_restarted":false}))
+}
+fn copy_tree(source: &Path, dest: &Path) -> Result<()> {
+    ensure!(!source.is_symlink(), "backup symlink forbidden");
+    fs::create_dir_all(dest)?;
+    for entry in fs::read_dir(source)? {
+        let path = entry?.path();
+        ensure!(!path.is_symlink(), "backup symlink forbidden");
+        let to = dest.join(path.file_name().context("backup entry missing name")?);
+        if path.is_dir() {
+            copy_tree(&path, &to)?;
+        } else {
+            fs::copy(&path, &to)?;
+            File::open(&to)?.sync_all()?;
+        }
+    }
+    File::open(dest)?.sync_all()?;
+    Ok(())
 }
 
 /// Build a transport plan from a stopped source or a consistent, user-created snapshot.
@@ -768,5 +881,16 @@ mod tests {
         assert!(endpoint("http://example.org:8765").is_err());
         assert!(endpoint("http://127.0.0.1:8765").is_ok());
         assert!(endpoint("https://example.org").is_ok());
+    }
+    #[test]
+    fn explicit_unlock_releases_duplicated_open_description() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lock");
+        let guard = lock(&path).unwrap();
+        let inherited = guard.0.try_clone().unwrap();
+        drop(guard);
+        let second = lock(&path).unwrap();
+        drop(second);
+        drop(inherited);
     }
 }
