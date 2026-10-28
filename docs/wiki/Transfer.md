@@ -74,7 +74,7 @@ gitcraft transfer commit --endpoint http://127.0.0.1:8765 \
 Проверьте approved branch, pins, launcher filename, закрытый внешний RCON и принятые вами условия Minecraft EULA. Затем из проверенного checkout инструмента:
 
 ```sh
-sudo bash scripts/bootstrap-server.sh --accept-eula
+sudo bash scripts/bootstrap-server.sh --accept-eula --autostart enabled
 ```
 
 Helper читает локальные secrets как данные, запускает bootstrap от пользователя minecraft и включает Minecraft и долгоживущий agent service только после успешной готовности. При нестандартном unit/User/launcher запустите CLI с проверенным config и окружением вместо helper, привязанного к стандартной fresh установке. Bootstrap не должен генерировать новый мир вместо переданного: перед запуском проверьте точное имя мира/папку и перенос всех dimensions.

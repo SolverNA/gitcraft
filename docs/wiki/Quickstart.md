@@ -69,3 +69,5 @@ gitcraft propose --repository /home/operator/minecraft-config \
 Если ваша deploy-ветка называется `release`, используйте `--base release` и `repository.branch: release`. Команда отправляет только новую ветку предложения. До merge агент не должен видеть изменение как релиз. После merge он скачает конкретный SHA, подготовит файлы и дождется пустого сервера.
 
 После успешного bootstrap/adopt проверьте в `/operations` фактические `active` и `enabled` фонового агента. При `activation_required` Minecraft уже инициализирован: повторите только включение агента, а не первый запуск. [Проверка и повтор активации](Operations.md).
+
+После инициализации также явно выберите в `/operations` политику Minecraft при загрузке машины: `enabled` или `disabled`. Это отдельная обязательная настройка; включённый Git-агент сам по себе не гарантирует запуск Minecraft после reboot. [Boot-политика и обслуживание](Operations.md).

@@ -38,7 +38,7 @@ cargo test --locked
 - HTTPS pins с SHA-256 и отдельные transfer-backed pins с проверенными receipt.
 - Прямой resumable transport: authentication, scoped sessions, chunks, offsets, SHA, квоты, verify и явное подтверждение замены мира.
 - Loopback Web UI: полные guarded settings, write-only credentials, bootstrap/EULA, stop/resume/recovery, offline backup/list, approved-config editor/diff/PR/retry и browser transfer/lifecycle cleanup. CLI и YAML остаются доступны.
-- Настраиваемый poll в долгоживущем systemd agent, автоактивация после bootstrap/adopt, actual active/enabled и отдельный retry при частичном успехе; RCON fail-closed и межпроцессная блокировка.
+- Настраиваемый poll в долгоживущем systemd agent, автоактивация poller после bootstrap/adopt, отдельный явный выбор Minecraft boot-политики, actual active/enabled и отдельный retry при частичном успехе; RCON fail-closed и межпроцессная блокировка.
 - Durable journal, backup hashes, осознанное stopped recovery после старта новой Java; отдельные offline game-data backups.
 
 ## Руководства
