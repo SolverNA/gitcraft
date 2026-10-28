@@ -48,7 +48,7 @@ fi
 [[ -d /run/systemd/system ]] || { printf '%s\n' 'A running systemd host is required.' >&2; exit 2; }
 [[ -x /usr/bin/busctl ]] || { printf '%s\n' 'busctl from the distribution systemd package is required for structured launcher verification. Install it before retrying.' >&2; exit 2; }
 reject_symlinks(){ local path=$1 current='' part; local -a parts; IFS='/' read -r -a parts <<< "$path"; for part in "${parts[@]}"; do [[ -n "$part" ]] || continue; current="$current/$part"; [[ ! -L "$current" ]] || { printf 'Refusing installation symlink: %s\n' "$current" >&2; exit 2; }; done; }
-for path in /opt/gitcraft/bin/gitcraft /etc/gitcraft/config/agent.yml /etc/gitcraft/secrets.env /etc/gitcraft/java.env /etc/gitcraft/ssh.conf /var/lib/minecraft/.ssh/id_ed25519 /var/lib/minecraft/.ssh/id_ed25519.pub /etc/sudoers.d/gitcraft /etc/systemd/system/gitcraft-agent.service /etc/systemd/system/gitcraft-web.service "/etc/systemd/system/$service" "$server_dir"; do reject_symlinks "$path"; done
+for path in /opt/gitcraft/bin/gitcraft /etc/gitcraft/config/agent.yml /etc/gitcraft/secrets.env /etc/gitcraft/java.env /etc/gitcraft/ssh.conf /etc/gitcraft/minecraft-unit.json /var/lib/minecraft/.ssh/id_ed25519 /var/lib/minecraft/.ssh/id_ed25519.pub /etc/sudoers.d/gitcraft /etc/systemd/system/gitcraft-agent.service /etc/systemd/system/gitcraft-web.service "/etc/systemd/system/$service" "$server_dir"; do reject_symlinks "$path"; done
 for directory in repository state cache staging backups; do reject_symlinks "/var/lib/minecraft/$directory"; done
 if [[ "$mode" == adopt ]]; then
   runtime_user=$(systemctl show --value --property=User "$service")
@@ -144,11 +144,18 @@ for unit in gitcraft-agent.service gitcraft-web.service; do
   chown root:root "/etc/systemd/system/$unit"
   chmod 0644 "/etc/systemd/system/$unit"
 done
+# Bind future boot-policy privileges to this root-reviewed installed Minecraft unit.
+if [[ "$mode" == new ]]; then scope_fragment="/etc/systemd/system/$service"; else scope_fragment=$(systemctl show --value --property=FragmentPath "$service"); fi
+[[ -n "$scope_fragment" && -f "$scope_fragment" ]] || { printf '%s\n' 'Minecraft unit fragment is unavailable; cannot create boot-policy authority.' >&2; exit 2; }
+jq -n --arg service "$service" --arg server "$server_dir" --arg fragment "$scope_fragment" '{service:$service,server:$server,fragment:$fragment}' > /etc/gitcraft/minecraft-unit.json
+chown root:root /etc/gitcraft/minecraft-unit.json
+chmod 0644 /etc/gitcraft/minecraft-unit.json
 # Migrate the old timer only: a single long-lived agent reads the configured interval.
 systemctl disable --now gitcraft-agent.timer >/dev/null 2>&1 || true
 sudoers=$(mktemp); trap 'rm -f -- "$sudoers"' EXIT
 printf '%s ALL=(root) NOPASSWD: /usr/bin/systemctl start %s, /usr/bin/systemctl stop %s, /usr/bin/systemctl is-active %s\n' "$runtime_user" "$service" "$service" "$service" > "$sudoers"
 printf '%s ALL=(root) NOPASSWD: /usr/bin/systemctl enable --now gitcraft-agent.service\n' "$runtime_user" >> "$sudoers"
+printf '%s ALL=(root) NOPASSWD: /usr/bin/systemctl enable %s, /usr/bin/systemctl disable %s\n' "$runtime_user" "$service" "$service" >> "$sudoers"
 visudo -cf "$sudoers"; install -m 0440 "$sudoers" /etc/sudoers.d/gitcraft
 systemctl daemon-reload
 systemctl enable --now gitcraft-web.service

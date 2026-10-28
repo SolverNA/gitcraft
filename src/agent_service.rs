@@ -39,7 +39,7 @@ fn bus(args: &[&str]) -> Result<Value> {
     serde_json::from_slice(&result.stdout)
         .map_err(|_| anyhow::anyhow!("Malformed poller discovery response; values omitted"))
 }
-fn trusted(path: &Path) -> Result<()> {
+pub(crate) fn trusted(path: &Path) -> Result<()> {
     let mut prefix = std::path::PathBuf::new();
     for component in path.components() {
         prefix.push(component);
@@ -243,6 +243,7 @@ pub(crate) fn activate_with(config: &Value, runtime: &mut impl Runtime) -> Resul
     let _activation = ActivationLock(file);
     {
         let _deployment = crate::deploy::lock_state(&config)?;
+        crate::minecraft_autostart::ensure_not_held(&config)?;
         ensure!(
             crate::recovery::pending(&config)?.is_none() && !crate::transfer::has_pending(&config)?,
             "Recovery is pending; resolve it before activating the poller"
@@ -301,6 +302,7 @@ pub(crate) fn initialize_with(
         ["deployed", "adopted"].contains(&result["status"].as_str().unwrap_or("")),
         "Initialization did not complete; poller activation was not attempted"
     );
+    crate::minecraft_autostart::initial_metadata(config, &mut result);
     let initialization_status = result["status"].clone();
     result["initialized"] = json!(true);
     result["initialization_status"] = initialization_status;

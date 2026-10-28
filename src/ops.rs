@@ -16,18 +16,33 @@ fn state(config: &Value, name: &str) -> Result<PathBuf> {
 }
 pub fn stop(config: &Value) -> Result<Value> {
     let config = crate::config::validate(config.clone())?;
-    let _lock = crate::deploy::lock_state(&config)?;
     let client = crate::deploy::client(&config)?;
-    ensure!(
-        client.online()? == 0,
-        "Players are online; maintenance stop rejected"
-    );
-    client.command("save-all flush")?;
-    ensure!(client.online()? == 0, "Player joined; stop rejected");
-    crate::deploy::service("stop", config["deployment"]["service"].as_str().unwrap())?;
-    crate::deploy::ensure_stopped(&config)?;
-    Ok(json!({"status":"completed","operation":"maintenance_stop","players_kicked":false}))
+    crate::minecraft_autostart::maintenance_with(
+        &config,
+        &mut crate::minecraft_autostart::SystemRuntime,
+        || {
+            ensure!(
+                client.online()? == 0,
+                "Players are online; maintenance stop rejected"
+            );
+            client.command("save-all flush")?;
+            ensure!(
+                client.online()? == 0,
+                "Player joined; maintenance stop rejected"
+            );
+            Ok(())
+        },
+        || {
+            ensure!(
+                client.online()? == 0,
+                "Player joined during boot suspension; Minecraft was not stopped and maintenance boot hold is retained"
+            );
+            crate::deploy::service("stop", config["deployment"]["service"].as_str().unwrap())?;
+            crate::deploy::ensure_stopped(&config)
+        },
+    )
 }
+
 fn properties(text: &str) -> BTreeMap<String, String> {
     text.lines()
         .filter_map(|line| {
@@ -57,8 +72,18 @@ pub fn resume(config: &Value, acknowledge: bool) -> Result<Value> {
         acknowledge,
         "Explicit acknowledgement of game-data compatibility is required"
     );
+    crate::minecraft_autostart::resume_with(
+        config,
+        &mut crate::minecraft_autostart::SystemRuntime,
+        || resume_inner(config, acknowledge),
+    )
+}
+fn resume_inner(config: &Value, acknowledge: bool) -> Result<Value> {
+    ensure!(
+        acknowledge,
+        "Explicit acknowledgement of game-data compatibility is required"
+    );
     let config = crate::config::validate(config.clone())?;
-    let _lock = crate::deploy::lock_state(&config)?;
     crate::deploy::ensure_stopped(&config)?;
     ensure!(
         crate::recovery::pending(&config)?.is_none() && !crate::transfer::has_pending(&config)?,

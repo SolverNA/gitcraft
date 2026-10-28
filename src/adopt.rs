@@ -12,7 +12,7 @@ pub(crate) fn show_unit(config: &Value) -> Result<Value> {
         Command::new("/usr/bin/systemctl").args([
             "show",
             "--no-pager",
-            "--property=Id,User,Group,WorkingDirectory,ExecStart,FragmentPath,MainPID,ActiveState",
+            "--property=Id,User,Group,WorkingDirectory,ExecStart,FragmentPath,MainPID,ActiveState,UnitFileState",
             name,
         ]),
         Duration::from_secs(30),
@@ -41,6 +41,17 @@ pub(crate) fn show_unit(config: &Value) -> Result<Value> {
         "ExecStartEx",
     ])?;
     attach_structured_launcher(&mut unit, &commands)?;
+    let dropins = bus_json(&[
+        "get-property",
+        "org.freedesktop.systemd1",
+        object,
+        "org.freedesktop.systemd1.Unit",
+        "DropInPaths",
+    ])?;
+    if dropins["type"] != "as" {
+        bail!("Structured Minecraft drop-in list unavailable");
+    }
+    unit["DropInPaths"] = dropins["data"].clone();
     Ok(unit)
 }
 fn attach_structured_launcher(unit: &mut Value, commands: &Value) -> Result<()> {
@@ -459,6 +470,7 @@ fn apply_inner(
     let state = Path::new(config["paths"]["state"].as_str().unwrap());
     fs::create_dir_all(state)?;
     let _lock = deploy::lock_state(&config)?;
+    crate::minecraft_autostart::ensure_not_held(&config)?;
     if crate::transfer::has_pending(&config)? {
         bail!("Pending transfer recovery blocks adoption");
     }

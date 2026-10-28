@@ -32,5 +32,8 @@ if "$script_dir/install.sh" --repository https://secret@github.com/team/config.g
 "$script_dir/bootstrap-repo.sh" --repository team/config --tool-repository team/tool --tool-ref aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --create --dry-run >/dev/null
 if "$script_dir/bootstrap-repo.sh" --repository team/config --tool-repository team/tool --tool-ref main --dry-run >/dev/null 2>&1; then exit 1; fi
 "$script_dir/bootstrap-server.sh" --accept-eula --dry-run >/dev/null
+"$script_dir/bootstrap-server.sh" --accept-eula --autostart enabled --dry-run >/dev/null
+"$script_dir/bootstrap-server.sh" --accept-eula --autostart disabled --dry-run >/dev/null
+if "$script_dir/bootstrap-server.sh" --accept-eula --autostart arbitrary --dry-run >/dev/null 2>&1; then exit 1; fi
 if "$script_dir/bootstrap-server.sh" --dry-run >/dev/null 2>&1; then exit 1; fi
 printf '%s\n' 'Installer and GitHub setup dry-run checks passed.'

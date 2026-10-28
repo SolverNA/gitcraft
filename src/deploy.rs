@@ -368,6 +368,7 @@ pub(crate) fn run_transaction(
         safe_path(&path, ".path-check")?;
         fs::create_dir_all(path)?;
     }
+    crate::minecraft_autostart::ensure_not_held(config)?;
     let state_file = state_dir.join("deployment.json");
     let state: Value = if state_file.exists() {
         serde_json::from_slice(&fs::read(&state_file)?)?
@@ -612,6 +613,7 @@ pub(crate) fn execute_with(
     let state = paths(config, "state")?;
     let _lock = lock_state(config)?;
     let result = (|| -> Result<Value> {
+        crate::minecraft_autostart::ensure_not_held(config)?;
         if crate::transfer::has_pending(config)? {
             bail!(
                 "Pending world-transfer recovery blocks deployment; explicitly recover the transfer while Minecraft is stopped"
