@@ -224,7 +224,7 @@ pub(crate) fn verify_launcher(config: &Value, unit: &Value, destination: &str) -
     }
     Ok(())
 }
-fn build_plan(config: &Value, server: &Path, unit: &Value) -> Result<Value> {
+pub(crate) fn build_plan(config: &Value, server: &Path, unit: &Value) -> Result<Value> {
     deploy::safe_path(server, "server.properties")?;
     let configured = Path::new(
         config["paths"]["server"]
@@ -319,7 +319,7 @@ fn apply_verified(
     repo: &Path,
     commit: &str,
     unit: &Value,
-    verify_rcon: impl Fn() -> Result<u32>,
+    mut verify_rcon: impl FnMut() -> Result<u32>,
 ) -> Result<Value> {
     if plan["kind"] != "adopt-plan-v1"
         || plan["service"] != config["deployment"]["service"]
@@ -400,7 +400,57 @@ fn apply_verified(
     recovery::durable_json(&state.join("status.json"), &result)?;
     Ok(result)
 }
+pub(crate) trait AdoptionRuntime {
+    fn snapshot(&mut self, config: &Value) -> Result<(String, std::path::PathBuf)>;
+    fn unit(&mut self, config: &Value) -> Result<Value>;
+    fn online(&mut self, config: &Value) -> Result<u32>;
+}
+struct LiveAdoption;
+impl AdoptionRuntime for LiveAdoption {
+    fn snapshot(&mut self, config: &Value) -> Result<(String, std::path::PathBuf)> {
+        gitrepo::snapshot(
+            config["repository"]["url"].as_str().unwrap(),
+            config["repository"]["branch"].as_str().unwrap(),
+            Path::new(config["paths"]["repository"].as_str().unwrap()),
+            Path::new(config["paths"]["staging"].as_str().unwrap()),
+        )
+    }
+    fn unit(&mut self, config: &Value) -> Result<Value> {
+        show_unit(config)
+    }
+    fn online(&mut self, config: &Value) -> Result<u32> {
+        deploy::client(config)?.online()
+    }
+}
 pub fn apply(config: &Value, plan: &Value, repo: &Path, expected_commit: &str) -> Result<Value> {
+    apply_with(
+        config,
+        plan,
+        repo,
+        expected_commit,
+        &mut LiveAdoption,
+        &mut crate::agent_service::SystemRuntime,
+    )
+}
+pub(crate) fn apply_with(
+    config: &Value,
+    plan: &Value,
+    repo: &Path,
+    expected_commit: &str,
+    runtime: &mut impl AdoptionRuntime,
+    agent: &mut impl crate::agent_service::Runtime,
+) -> Result<Value> {
+    crate::agent_service::initialize_with(config, agent, || {
+        apply_inner(config, plan, repo, expected_commit, runtime)
+    })
+}
+fn apply_inner(
+    config: &Value,
+    plan: &Value,
+    repo: &Path,
+    expected_commit: &str,
+    runtime: &mut impl AdoptionRuntime,
+) -> Result<Value> {
     let config = crate::config::validate(config.clone())?;
     if git_head(repo)? != expected_commit {
         bail!("Reviewed HEAD differs from expected commit");
@@ -412,24 +462,18 @@ pub fn apply(config: &Value, plan: &Value, repo: &Path, expected_commit: &str) -
     if crate::transfer::has_pending(&config)? {
         bail!("Pending transfer recovery blocks adoption");
     }
-    let (approved, staged) = gitrepo::snapshot(
-        config["repository"]["url"].as_str().unwrap(),
-        config["repository"]["branch"].as_str().unwrap(),
-        Path::new(config["paths"]["repository"].as_str().unwrap()),
-        Path::new(config["paths"]["staging"].as_str().unwrap()),
-    )?;
+    let (approved, staged) = runtime.snapshot(&config)?;
     if approved != expected_commit {
         bail!("Expected adoption commit is not the current approved branch HEAD");
     }
     crate::policy::validate_repository(&staged)?;
-    let client = deploy::client(&config)?;
     apply_verified(
         &config,
         plan,
         &staged,
         &approved,
-        &show_unit(&config)?,
-        || client.online(),
+        &runtime.unit(&config)?,
+        || runtime.online(&config),
     )
 }
 #[cfg(test)]

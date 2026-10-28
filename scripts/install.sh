@@ -141,15 +141,18 @@ if [[ "$mode" == new ]]; then
 fi
 for unit in gitcraft-agent.service gitcraft-web.service; do
   sed -e "s|User=minecraft|User=$runtime_user|" -e "s|Group=minecraft|Group=$runtime_group|" -e "s|ReadWritePaths=/var/lib/minecraft$|ReadWritePaths=/var/lib/minecraft $server_dir|" -e "s|ReadWritePaths=/etc/gitcraft/config /var/lib/minecraft$|ReadWritePaths=/etc/gitcraft/config /var/lib/minecraft $server_dir|" "$source_dir/systemd/$unit" > "/etc/systemd/system/$unit"
+  chown root:root "/etc/systemd/system/$unit"
+  chmod 0644 "/etc/systemd/system/$unit"
 done
 # Migrate the old timer only: a single long-lived agent reads the configured interval.
 systemctl disable --now gitcraft-agent.timer >/dev/null 2>&1 || true
 sudoers=$(mktemp); trap 'rm -f -- "$sudoers"' EXIT
 printf '%s ALL=(root) NOPASSWD: /usr/bin/systemctl start %s, /usr/bin/systemctl stop %s, /usr/bin/systemctl is-active %s\n' "$runtime_user" "$service" "$service" "$service" > "$sudoers"
+printf '%s ALL=(root) NOPASSWD: /usr/bin/systemctl enable --now gitcraft-agent.service\n' "$runtime_user" >> "$sudoers"
 visudo -cf "$sudoers"; install -m 0440 "$sudoers" /etc/sudoers.d/gitcraft
 systemctl daemon-reload
 systemctl enable --now gitcraft-web.service
 printf '%s\n' 'Installed. Existing configuration, credentials, runtime data and unmanaged Minecraft unit were preserved.' 'Register the following public key as a READ-ONLY repository deploy key:'
 cat /var/lib/minecraft/.ssh/id_ed25519.pub
 printf '%s\n' 'Verify GitHub host fingerprints independently, populate /var/lib/minecraft/.ssh/known_hosts.' 'SSH UI tunnel: ssh -L 8765:127.0.0.1:8765 USER@VPS; browser http://127.0.0.1:8765.' 'Read UI token locally from root-only /etc/gitcraft/secrets.env. Block external RCON IPv4+IPv6.'
-if [[ "$mode" == adopt ]]; then printf '%s\n' 'Review gitcraft adopt plan/apply first; no existing Minecraft stop/start or credential reset was performed.' 'After successful adoption: systemctl enable --now gitcraft-agent.service'; else printf '%s\n' 'Pin/import engine and review config, then explicit EULA bootstrap; see scripts/bootstrap-server.sh.'; fi
+if [[ "$mode" == adopt ]]; then printf '%s\n' 'Review gitcraft adopt plan/apply first; no existing Minecraft stop/start or credential reset was performed.' 'Successful reviewed adoption activates the installed poller automatically; activation_required means retry gitcraft agent-activate without repeating adoption.'; else printf '%s\n' 'Pin/import engine and review config, then explicit EULA bootstrap; see scripts/bootstrap-server.sh.'; fi

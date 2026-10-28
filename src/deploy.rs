@@ -602,7 +602,7 @@ fn execute(config: &Value, bootstrap: bool) -> Result<Value> {
         ensure_stopped,
     )
 }
-fn execute_with(
+pub(crate) fn execute_with(
     config: &Value,
     run: impl FnOnce(&Value) -> Result<Value>,
     stopped: impl Fn(&Value) -> Result<()>,
@@ -656,7 +656,7 @@ pub fn bootstrap(config: &Value, accept_eula: bool) -> Result<Value> {
     if !accept_eula {
         bail!("Bootstrap requires explicit --accept-eula");
     }
-    execute(config, true)
+    crate::agent_service::initialize(config, || execute(config, true))
 }
 #[cfg(test)]
 mod tests {

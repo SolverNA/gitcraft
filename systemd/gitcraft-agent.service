@@ -18,7 +18,7 @@ PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
 ReadWritePaths=/var/lib/minecraft
-# sudo is limited to three operations on minecraft.service; NoNewPrivileges would block it.
+# sudo permits only scoped Minecraft operations and enable --now of this fixed agent unit.
 
 [Install]
 WantedBy=multi-user.target
