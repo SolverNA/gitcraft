@@ -68,3 +68,33 @@ $('commit').onclick = run(async () => {
 $('recover').onclick = run(async () => say(await api(route('/recover'), 'POST', '{}', {...auth(), 'Content-Type': 'application/json'})));
 const fresh = document.createElement('button'); fresh.textContent = 'Новая сессия'; fresh.onclick = () => { session = null; localStorage.removeItem('gitcraft.transfer'); say('Выберите новый источник. Предыдущие staged-файлы на сервере не удалены.'); }; $('output').after(fresh);
 if (session) say(`Есть сохранённая сессия ${session.id}. Для resume выберите те же файлы/папку; «Статус» доступен без выбора.`);
+
+// Lifecycle administration uses the authenticated browser session + CSRF, never
+// a raw admin token in JavaScript. A scoped transfer token can only cancel itself.
+let cleanup = null;
+const adminHeaders = () => ({'Content-Type': 'application/json', 'X-CSRF-Token': $('csrf').value});
+const lifecycleSay = value => { $('sessionlist').textContent = typeof value === 'string' ? value : JSON.stringify(value, null, 2); };
+function lifecycleRun(fn) { return async () => { try { await fn(); } catch (error) { lifecycleSay(`Ошибка: ${error.message}`); } }; }
+if ($('sessions')) {
+  $('sessions').onclick = lifecycleRun(async () => lifecycleSay(await api('/api/transfer-sessions', 'GET', null, adminHeaders())));
+  $('cleanupplan').onclick = lifecycleRun(async () => {
+    const ids = $('cleanupids').value.trim().split(/\s+/).filter(Boolean);
+    cleanup = await api('/api/transfer-sessions/cleanup-plan', 'POST', JSON.stringify({ids}), adminHeaders());
+    $('cleanupreviewed').checked = false;
+    lifecycleSay(cleanup);
+  });
+  $('cleanupapply').onclick = lifecycleRun(async () => {
+    if (!cleanup || !$('cleanupreviewed').checked) throw new Error('Сначала получите план очистки и подтвердите его проверку.');
+    const result = await api('/api/transfer-sessions/cleanup-apply', 'POST', JSON.stringify({digest: cleanup.digest, reviewed: true}), adminHeaders());
+    lifecycleSay(result); cleanup = null; $('cleanupreviewed').checked = false;
+    if (session && result.removed.includes(session.id)) { session = null; localStorage.removeItem('gitcraft.transfer'); say('Staging сессии удалён; импортированный cache и receipts сохранены.'); }
+  });
+  $('cancel').onclick = lifecycleRun(async () => { lifecycleSay(await api(route('/cancel'), 'POST', '{}', {...auth(), 'Content-Type': 'application/json'})); });
+  const cancelById = document.createElement('button'); cancelById.textContent = 'Отменить выбранную сессию по ID';
+  cancelById.onclick = lifecycleRun(async () => {
+    const ids = $('cleanupids').value.trim().split(/\s+/).filter(Boolean);
+    if (ids.length !== 1) throw new Error('Укажите ровно один ID в поле выбора сессий.');
+    lifecycleSay(await api('/api/transfer-sessions/cancel', 'POST', JSON.stringify({id: ids[0]}), adminHeaders()));
+  });
+  $('cancel').after(cancelById);
+}

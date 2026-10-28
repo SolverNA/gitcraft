@@ -100,11 +100,17 @@ impl Drop for LockGuard {
     }
 }
 fn lock(path: &Path) -> Result<LockGuard> {
+    let path = crate::deploy::safe_path(
+        path.parent().context("lock parent missing")?,
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .context("invalid lock filename")?,
+    )?;
     let f = OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(false)
-        .open(path)?;
+        .open(&path)?;
     f.try_lock_exclusive()
         .context("transfer operation already running")?;
     // Explicit unlock on scope exit: a parallel fork can transiently inherit the
@@ -345,13 +351,53 @@ pub fn create(config: &Value, manifest: Manifest) -> Result<Value> {
     Ok(json!({"id":id,"token":token,"chunk_bytes":CHUNK_BYTES,"status":"receiving"}))
 }
 pub fn status(config: &Value, id: &str, token: &str) -> Result<Value> {
-    let (dir, s) = load(config, id, token)?;
+    let dir = session_dir(config, id)?;
     let _guard = lock(&dir.join("session.lock"))?;
+    let (_, s) = load(config, id, token)?;
     Ok(
         json!({"id":s.id,"manifest":s.manifest,"offsets":s.offsets,"verified":s.verified,"status":s.status,"chunk_bytes":CHUNK_BYTES}),
     )
 }
 pub fn chunk(
+    config: &Value,
+    id: &str,
+    token: &str,
+    index: usize,
+    offset: u64,
+    digest: &str,
+    bytes: &[u8],
+) -> Result<Value> {
+    let dir = session_dir(config, id)?;
+    let _guard = lock(&dir.join("session.lock"))?;
+    chunk_locked(config, id, token, index, offset, digest, bytes)
+}
+// Wire fields stay explicit so the HTTP layer cannot acquire a lock after reading.
+#[allow(clippy::too_many_arguments)]
+pub fn receive_chunk(
+    config: &Value,
+    id: &str,
+    token: &str,
+    index: usize,
+    offset: u64,
+    digest: &str,
+    reader: &mut dyn Read,
+    length: usize,
+) -> Result<Value> {
+    ensure!(
+        length > 0 && length <= CHUNK_BYTES,
+        "chunk outside byte limit"
+    );
+    let dir = session_dir(config, id)?;
+    let _guard = lock(&dir.join("session.lock"))?;
+    let (_, s) = load(config, id, token)?;
+    ensure!(s.status == "receiving", "session no longer accepts chunks");
+    ensure!(index < s.manifest.files.len(), "unknown file index");
+    let mut bytes = Vec::with_capacity(length);
+    reader.take(length as u64 + 1).read_to_end(&mut bytes)?;
+    ensure!(bytes.len() == length, "incomplete or oversized chunk body");
+    chunk_locked(config, id, token, index, offset, digest, &bytes)
+}
+fn chunk_locked(
     config: &Value,
     id: &str,
     token: &str,
@@ -369,7 +415,6 @@ pub fn chunk(
         "chunk SHA-256 mismatch"
     );
     let dir = session_dir(config, id)?;
-    let _guard = lock(&dir.join("session.lock"))?;
     let (_, mut s) = load(config, id, token)?;
     ensure!(s.status == "receiving", "session no longer accepts chunks");
     let f = s.manifest.files.get(index).context("unknown file index")?;
@@ -836,6 +881,356 @@ pub fn send(base: &str, admin_token: &str, plan_path: &Path, resume_path: &Path)
     )
 }
 
+// Lifecycle lock order: create.lock -> session locks sorted by ID. Chunk/commit
+// only hold their own session lock; cleanup never waits for a deployment lock.
+fn raw_session(dir: &Path) -> Result<Session> {
+    Ok(serde_json::from_slice(&fs::read(
+        crate::deploy::safe_path(dir, "session.json")?,
+    )?)?)
+}
+fn session_summary(config: &Value, dir: &Path, s: &Session, busy: bool) -> Result<Value> {
+    let expires = s
+        .created
+        .saturating_add(limit(config, "session_ttl_seconds", 604800));
+    let expired = now() > expires;
+    let staged = staged_bytes(&dir.join("data"))?;
+    let disk = staged_bytes(dir)?;
+    let declared = s
+        .manifest
+        .files
+        .iter()
+        .try_fold(0u64, |n, f| n.checked_add(f.size).context("quota overflow"))?;
+    let journal = dir.join("journal.json");
+    let pending = if journal.exists() {
+        let value: Value =
+            serde_json::from_slice(&fs::read(crate::deploy::safe_path(dir, "journal.json")?)?)?;
+        s.status != "committed" || value["phase"] != "committed"
+    } else {
+        false
+    };
+    let reason = if busy {
+        Some("active operation holds session lock")
+    } else if pending || s.status == "recovery_required" {
+        Some("pending world commit or recovery")
+    } else if s.status == "committed" && !dir.join("receipt.json").is_file() {
+        Some("committed receipt missing; inspect before cleanup")
+    } else if !["committed", "cancelled", "receiving", "verified"].contains(&s.status.as_str()) {
+        Some("unknown session state")
+    } else if !["committed", "cancelled"].contains(&s.status.as_str()) && !expired {
+        Some("active unexpired session; cancel explicitly first")
+    } else {
+        None
+    };
+    Ok(
+        json!({"id":s.id,"status":s.status,"created":s.created,"expires":expires,"expired":expired,"staged_bytes":staged,"disk_bytes":disk,"reserved_bytes":if s.status=="committed"{staged}else{declared.max(staged)},"eligible_cleanup":reason.is_none(),"protected_reason":reason}),
+    )
+}
+fn session_fingerprint(config: &Value, dir: &Path, s: &Session) -> Result<String> {
+    let summary = session_summary(config, dir, s, false)?;
+    Ok(hash(&serde_json::to_vec(
+        &json!({"session_hash":hash(&fs::read(dir.join("session.json"))?),"created":summary["created"],"expires":summary["expires"],"status":summary["status"],"disk_bytes":summary["disk_bytes"],"staged_bytes":summary["staged_bytes"],"receipt":if dir.join("receipt.json").exists(){Some(hash(&fs::read(crate::deploy::safe_path(dir,"receipt.json")?)?))}else{None}}),
+    )?))
+}
+fn session_entries(base: &Path) -> Result<Vec<PathBuf>> {
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(base)? {
+        let path = entry?.path();
+        ensure!(!path.is_symlink(), "transfer root symlink forbidden");
+        if path.is_dir()
+            && path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(valid_hash)
+        {
+            entries.push(path);
+        }
+    }
+    entries.sort();
+    Ok(entries)
+}
+pub fn list_sessions(config: &Value) -> Result<Value> {
+    let base = root(config)?;
+    let _global = lock(&base.join("create.lock"))?;
+    let mut sessions = Vec::new();
+    let (mut staged, mut reserved) = (0u64, 0u64);
+    for dir in session_entries(&base)? {
+        let guard = lock(&crate::deploy::safe_path(&dir, "session.lock")?);
+        let s = raw_session(&dir)?;
+        let value = session_summary(config, &dir, &s, guard.is_err())?;
+        staged = staged
+            .checked_add(
+                value["staged_bytes"]
+                    .as_u64()
+                    .context("staged size missing")?,
+            )
+            .context("size overflow")?;
+        reserved = reserved
+            .checked_add(
+                value["reserved_bytes"]
+                    .as_u64()
+                    .context("reserved size missing")?,
+            )
+            .context("size overflow")?;
+        sessions.push(value);
+    }
+    for entry in fs::read_dir(&base)? {
+        let dir = entry?.path();
+        let Some(id) = dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_prefix("deleting-"))
+            .filter(|id| valid_hash(id))
+        else {
+            continue;
+        };
+        ensure!(!dir.is_symlink(), "cleanup tombstone symlink forbidden");
+        if !dir.is_dir() {
+            continue;
+        }
+        let bytes = staged_bytes(&dir.join("data"))?;
+        let reserve = match raw_session(&dir) {
+            Ok(s) if s.status != "committed" => s
+                .manifest
+                .files
+                .iter()
+                .try_fold(0u64, |n, f| n.checked_add(f.size).context("size overflow"))?
+                .max(bytes),
+            _ => bytes,
+        };
+        staged = staged.checked_add(bytes).context("size overflow")?;
+        reserved = reserved.checked_add(reserve).context("size overflow")?;
+        sessions.push(json!({"id":id,"status":"cleanup_in_progress","staged_bytes":bytes,"reserved_bytes":reserve,"disk_bytes":staged_bytes(&dir)?,"eligible_cleanup":false,"protected_reason":"resume the reviewed cleanup plan"}));
+    }
+    Ok(
+        json!({"sessions":sessions,"staged_bytes":staged,"reserved_bytes":reserved,"max_staging_bytes":limit(config,"max_staging_bytes",200*1024*1024*1024),"cleanup_pending":base.join("cleanup-journal.json").exists()}),
+    )
+}
+pub fn cancel(config: &Value, id: &str, token: &str) -> Result<Value> {
+    cancel_session(config, id, Some(token))
+}
+pub fn cancel_admin(config: &Value, id: &str) -> Result<Value> {
+    cancel_session(config, id, None)
+}
+fn cancel_session(config: &Value, id: &str, token: Option<&str>) -> Result<Value> {
+    let dir = session_dir(config, id)?;
+    let _guard = lock(&crate::deploy::safe_path(&dir, "session.lock")?)?;
+    let mut s = if let Some(token) = token {
+        load_inner(config, id, token, true)?.1
+    } else {
+        raw_session(&dir)?
+    };
+    ensure!(
+        !dir.join("journal.json").exists() && s.status != "recovery_required",
+        "pending world commit/recovery cannot be cancelled"
+    );
+    if s.status == "cancelled" {
+        return Ok(json!({"id":id,"status":"cancelled"}));
+    }
+    ensure!(
+        ["receiving", "verified"].contains(&s.status.as_str()),
+        "only receiving or verified sessions can be cancelled"
+    );
+    s.status = "cancelled".into();
+    s.verified = false;
+    save(&dir, &s)?;
+    Ok(json!({"id":id,"status":"cancelled","data_deleted":false}))
+}
+fn lifecycle_plan_file(base: &Path) -> PathBuf {
+    base.join("cleanup-plan.json")
+}
+fn safe_lifecycle_files(base: &Path) -> Result<()> {
+    for name in [
+        "cleanup-plan.json",
+        "cleanup-journal.json",
+        "cleanup-last.json",
+    ] {
+        crate::deploy::safe_path(base, name)?;
+    }
+    Ok(())
+}
+pub fn cleanup_plan(config: &Value, ids: &[String]) -> Result<Value> {
+    let base = root(config)?;
+    safe_lifecycle_files(&base)?;
+    let _global = lock(&base.join("create.lock"))?;
+    let journal = base.join("cleanup-journal.json");
+    if journal.exists() {
+        let value: Value = serde_json::from_slice(&fs::read(journal)?)?;
+        return Ok(json!({"digest":value["digest"],"plan":value["plan"],"resume":true}));
+    }
+    let selected: BTreeSet<String> = ids
+        .iter()
+        .map(|id| {
+            ensure!(valid_hash(id), "invalid transfer ID");
+            Ok(id.clone())
+        })
+        .collect::<Result<_>>()?;
+    let (mut candidates, mut protected, mut seen) = (Vec::new(), Vec::new(), BTreeSet::new());
+    let mut bytes = 0u64;
+    for dir in session_entries(&base)? {
+        let id = dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .context("invalid session directory")?;
+        if !selected.is_empty() && !selected.contains(id) {
+            continue;
+        }
+        seen.insert(id.to_owned());
+        let guard = lock(&crate::deploy::safe_path(&dir, "session.lock")?);
+        let s = raw_session(&dir)?;
+        let summary = session_summary(config, &dir, &s, guard.is_err())?;
+        if summary["eligible_cleanup"] == true {
+            let size = summary["disk_bytes"]
+                .as_u64()
+                .context("disk size missing")?;
+            bytes = bytes.checked_add(size).context("cleanup size overflow")?;
+            candidates.push(json!({"id":id,"fingerprint":session_fingerprint(config,&dir,&s)?,"disk_bytes":size,"status":s.status,"expires":summary["expires"]}));
+        } else {
+            protected.push(summary);
+        }
+    }
+    ensure!(selected.is_subset(&seen), "unknown session ID requested");
+    let plan = json!({"schema":1,"root":base,"candidates":candidates,"protected":protected,"reclaim_bytes":bytes});
+    let digest = hash(&serde_json::to_vec(&plan)?);
+    atom(
+        &lifecycle_plan_file(&base),
+        &json!({"digest":digest,"plan":plan}),
+    )?;
+    Ok(json!({"digest":digest,"plan":plan,"resume":false}))
+}
+fn archive_session(config: &Value, dir: &Path, s: &Session) -> Result<()> {
+    let state = Path::new(config["paths"]["state"].as_str().context("state missing")?);
+    let archive = crate::deploy::safe_path(state, "transfer-receipts")?;
+    fs::create_dir_all(&archive)?;
+    let receipt = if dir.join("receipt.json").exists() {
+        Some(serde_json::from_slice::<Value>(&fs::read(
+            crate::deploy::safe_path(dir, "receipt.json")?,
+        )?)?)
+    } else {
+        None
+    };
+    atom(
+        &crate::deploy::safe_path(&archive, &format!("{}.json", s.id))?,
+        &json!({"id":s.id,"status":s.status,"created":s.created,"manifest":s.manifest,"receipt":receipt,"cleaned_at":now(),"cleanup_fingerprint":session_fingerprint(config,dir,s)?}),
+    )
+}
+pub fn cleanup_apply(config: &Value, digest: &str, reviewed: bool) -> Result<Value> {
+    cleanup_apply_with(config, digest, reviewed, || Ok(()))
+}
+fn cleanup_apply_with(
+    config: &Value,
+    digest: &str,
+    reviewed: bool,
+    after_rename: impl Fn() -> Result<()>,
+) -> Result<Value> {
+    ensure!(reviewed, "cleanup requires explicit reviewed confirmation");
+    ensure!(valid_hash(digest), "invalid cleanup plan digest");
+    let base = root(config)?;
+    safe_lifecycle_files(&base)?;
+    let _global = lock(&base.join("create.lock"))?;
+    let journal_path = base.join("cleanup-journal.json");
+    let last = base.join("cleanup-last.json");
+    if !journal_path.exists() && last.exists() {
+        let value: Value = serde_json::from_slice(&fs::read(&last)?)?;
+        if value["digest"] == digest {
+            return Ok(value["result"].clone());
+        }
+    }
+    let plan_path = lifecycle_plan_file(&base);
+    let saved: Value = serde_json::from_slice(&fs::read(if journal_path.exists() {
+        &journal_path
+    } else {
+        &plan_path
+    })?)?;
+    ensure!(
+        saved["digest"] == digest && hash(&serde_json::to_vec(&saved["plan"])?) == digest,
+        "cleanup plan changed; preview again"
+    );
+    let plan = &saved["plan"];
+    ensure!(
+        plan["root"].as_str() == base.to_str(),
+        "cleanup plan belongs to another state root"
+    );
+    let entries = plan["candidates"]
+        .as_array()
+        .context("cleanup candidates missing")?;
+    ensure!(!entries.is_empty(), "no eligible sessions in cleanup plan");
+    let recovering = journal_path.exists();
+    let mut guards = Vec::new();
+    // Validate and lock every selected session before deleting any. Protected
+    // sessions remain intact when one candidate has changed since preview.
+    for entry in entries {
+        let id = entry["id"].as_str().context("session ID missing")?;
+        let dir = session_dir(config, id)?;
+        let tomb = crate::deploy::safe_path(&base, &format!("deleting-{id}"))?;
+        ensure!(
+            !(dir.exists() && tomb.exists()),
+            "ambiguous cleanup tombstone"
+        );
+        if recovering && !dir.exists() {
+            // remove_dir_all can be interrupted after deleting session.json.
+            // A durable journal + archived fingerprint authorize only this exact
+            // detached tombstone; never infer ownership from its filename alone.
+            let state = Path::new(config["paths"]["state"].as_str().context("state missing")?);
+            let archive = crate::deploy::safe_path(state, &format!("transfer-receipts/{id}.json"))?;
+            let audit: Value = serde_json::from_slice(&fs::read(archive)?)?;
+            ensure!(
+                audit["id"] == id && audit["cleanup_fingerprint"] == entry["fingerprint"],
+                "cleanup audit fingerprint mismatch"
+            );
+            if tomb.exists() {
+                guards.push(lock(&crate::deploy::safe_path(&tomb, "session.lock")?)?);
+                staged_bytes(&tomb)?;
+            }
+            continue;
+        }
+        if dir.exists() {
+            let path = dir;
+            guards.push(lock(&crate::deploy::safe_path(&path, "session.lock")?)?);
+            let s = raw_session(&path)?;
+            ensure!(s.id == id, "session identity mismatch");
+            let summary = session_summary(config, &path, &s, false)?;
+            ensure!(
+                summary["eligible_cleanup"] == true,
+                "session is active or needs recovery; cleanup refused"
+            );
+            ensure!(
+                entry["fingerprint"] == session_fingerprint(config, &path, &s)?,
+                "session changed; preview cleanup again"
+            );
+            archive_session(config, &path, &s)?;
+        } else {
+            bail!("session disappeared; preview cleanup again");
+        }
+    }
+    if !recovering {
+        atom(&journal_path, &json!({"digest":digest,"plan":plan}))?;
+    }
+    let mut removed = Vec::new();
+    for entry in entries {
+        let id = entry["id"].as_str().context("session ID missing")?;
+        let dir = session_dir(config, id)?;
+        let tomb = crate::deploy::safe_path(&base, &format!("deleting-{id}"))?;
+        if dir.exists() {
+            fs::rename(&dir, &tomb)?;
+            File::open(&base)?.sync_all()?;
+            after_rename()?;
+        }
+        if tomb.exists() {
+            // Full-tree preflight forbids following any symlink during removal.
+            staged_bytes(&tomb)?;
+            fs::remove_dir_all(&tomb)?;
+            File::open(&base)?.sync_all()?;
+        }
+        removed.push(id.to_owned());
+    }
+    let result = json!({"status":"cleaned","removed":removed,"reclaimed_bytes":plan["reclaim_bytes"],"imported_cache_preserved":true,"receipts_archived":true});
+    atom(&last, &json!({"digest":digest,"result":result}))?;
+    fs::remove_file(&journal_path)?;
+    File::open(&base)?.sync_all()?;
+    drop(guards);
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -949,5 +1344,184 @@ mod tests {
         // usage is counted even if the session metadata no longer reserves it.
         fs::write(path.join("data/partial.tmp"), b"1234").unwrap();
         assert!(create(&config, manifest(b"x")).is_err());
+    }
+    #[test]
+    fn cleanup_frees_quota_but_active_session_remains_usable() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = config(dir.path());
+        c["transfer"]["max_session_bytes"] = json!(6);
+        c["transfer"]["max_staging_bytes"] = json!(6);
+        let a = create(&c, manifest(b"aaa")).unwrap();
+        let b = create(&c, manifest(b"bbb")).unwrap();
+        let bid = b["id"].as_str().unwrap();
+        let bt = b["token"].as_str().unwrap();
+        chunk(&c, bid, bt, 0, 0, &hash(b"bbb"), b"bbb").unwrap();
+        assert!(create(&c, manifest(b"x")).is_err());
+        assert!(cancel(&c, bid, "wrong").is_err());
+        cancel(&c, bid, bt).unwrap();
+        assert!(chunk(&c, bid, bt, 0, 0, &hash(b"bbb"), b"bbb").is_err());
+        let listing = list_sessions(&c).unwrap();
+        assert!(!listing.to_string().contains(bt));
+        let plan = cleanup_plan(&c, &[]).unwrap();
+        assert_eq!(plan["plan"]["candidates"].as_array().unwrap().len(), 1);
+        assert_eq!(plan["plan"]["protected"].as_array().unwrap().len(), 1);
+        let digest = plan["digest"].as_str().unwrap();
+        assert!(cleanup_apply(&c, digest, false).is_err());
+        cleanup_apply(&c, digest, true).unwrap();
+        assert!(!session_dir(&c, bid).unwrap().exists());
+        assert!(
+            dir.path()
+                .join(format!("state/transfer-receipts/{bid}.json"))
+                .exists()
+        );
+        create(&c, manifest(b"ccc")).unwrap();
+        chunk(
+            &c,
+            a["id"].as_str().unwrap(),
+            a["token"].as_str().unwrap(),
+            0,
+            0,
+            &hash(b"aaa"),
+            b"aaa",
+        )
+        .unwrap();
+    }
+    #[test]
+    fn cleanup_protects_pending_worlds_and_revalidates_changed_plans() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = config(dir.path());
+        let a = create(&c, manifest(b"a")).unwrap();
+        let id = a["id"].as_str().unwrap();
+        let token = a["token"].as_str().unwrap();
+        let (path, mut s) = load(&c, id, token).unwrap();
+        s.created = 0;
+        s.status = "recovery_required".into();
+        save(&path, &s).unwrap();
+        atom(&path.join("journal.json"), &json!({"phase":"prepared"})).unwrap();
+        assert!(cancel_admin(&c, id).is_err());
+        let plan = cleanup_plan(&c, &[]).unwrap();
+        assert!(plan["plan"]["candidates"].as_array().unwrap().is_empty());
+        assert!(path.exists());
+        let b = create(&c, manifest(b"b")).unwrap();
+        let bid = b["id"].as_str().unwrap();
+        cancel_admin(&c, bid).unwrap();
+        let plan = cleanup_plan(&c, &[bid.to_owned()]).unwrap();
+        let bdir = session_dir(&c, bid).unwrap();
+        let mut s = raw_session(&bdir).unwrap();
+        s.status = "receiving".into();
+        save(&bdir, &s).unwrap();
+        assert!(cleanup_apply(&c, plan["digest"].as_str().unwrap(), true).is_err());
+        assert!(bdir.exists());
+        assert!(path.join("journal.json").exists());
+    }
+    #[test]
+    fn cleanup_preserves_imported_jar_and_durable_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = config(dir.path());
+        fs::create_dir_all(dir.path().join("server")).unwrap();
+        fs::create_dir_all(dir.path().join("backups")).unwrap();
+        let mut m = manifest(b"jar");
+        m.files[0].kind = "plugin".into();
+        m.files[0].path = "Local.jar".into();
+        let s = create(&c, m).unwrap();
+        let id = s["id"].as_str().unwrap();
+        let token = s["token"].as_str().unwrap();
+        chunk(&c, id, token, 0, 0, &hash(b"jar"), b"jar").unwrap();
+        verify(&c, id, token).unwrap();
+        commit_with(&c, id, token, false, || Ok(())).unwrap();
+        let plan = cleanup_plan(&c, &[id.to_owned()]).unwrap();
+        cleanup_apply(&c, plan["digest"].as_str().unwrap(), true).unwrap();
+        assert!(
+            dir.path()
+                .join(format!("cache/{}.jar", hash(b"jar")))
+                .exists()
+        );
+        assert!(
+            dir.path()
+                .join(format!("cache/{}.receipt.json", hash(b"jar")))
+                .exists()
+        );
+        let receipt: Value = serde_json::from_slice(
+            &fs::read(
+                dir.path()
+                    .join(format!("state/transfer-receipts/{id}.json")),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            receipt["receipt"]["artifacts"]
+                .as_array()
+                .is_some_and(|a| !a.is_empty())
+        );
+        assert!(!receipt.to_string().contains(token));
+    }
+    #[test]
+    fn cleanup_resumes_after_partial_tombstone_removal_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = config(dir.path());
+        let s = create(&c, manifest(b"partial")).unwrap();
+        let id = s["id"].as_str().unwrap();
+        let token = s["token"].as_str().unwrap();
+        chunk(&c, id, token, 0, 0, &hash(b"partial"), b"partial").unwrap();
+        cancel(&c, id, token).unwrap();
+        let plan = cleanup_plan(&c, &[]).unwrap();
+        let digest = plan["digest"].as_str().unwrap();
+        assert!(
+            cleanup_apply_with(&c, digest, true, || bail!("simulated crash after rename")).is_err()
+        );
+        let tomb = root(&c).unwrap().join(format!("deleting-{id}"));
+        assert!(tomb.exists());
+        fs::remove_file(tomb.join("session.json")).unwrap();
+        fs::remove_file(tomb.join("data/0")).unwrap();
+        assert_eq!(cleanup_plan(&c, &[]).unwrap()["resume"], true);
+        let result = cleanup_apply(&c, digest, true).unwrap();
+        assert!(!tomb.exists());
+        assert_eq!(cleanup_apply(&c, digest, true).unwrap(), result);
+        assert_eq!(list_sessions(&c).unwrap()["cleanup_pending"], false);
+    }
+    #[test]
+    fn body_reader_holds_lock_even_if_session_expires_mid_request() {
+        struct Reader<'a> {
+            c: &'a Value,
+            id: &'a str,
+            read: bool,
+        }
+        impl Read for Reader<'_> {
+            fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+                if self.read {
+                    return Ok(0);
+                }
+                self.read = true;
+                assert!(cancel_admin(self.c, self.id).is_err());
+                let path = session_dir(self.c, self.id).unwrap();
+                let mut s = raw_session(&path).unwrap();
+                s.created = 0;
+                save(&path, &s).unwrap();
+                let plan = cleanup_plan(self.c, &[]).unwrap();
+                assert!(plan["plan"]["candidates"].as_array().unwrap().is_empty());
+                assert!(
+                    plan["plan"]["protected"][0]["protected_reason"]
+                        .as_str()
+                        .unwrap()
+                        .contains("active operation")
+                );
+                out[..3].copy_from_slice(b"abc");
+                Ok(3)
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let c = config(dir.path());
+        let s = create(&c, manifest(b"abc")).unwrap();
+        let id = s["id"].as_str().unwrap();
+        let token = s["token"].as_str().unwrap();
+        let mut reader = Reader {
+            c: &c,
+            id,
+            read: false,
+        };
+        assert!(receive_chunk(&c, id, token, 0, 0, &hash(b"abc"), &mut reader, 3).is_err());
+        let plan = cleanup_plan(&c, &[]).unwrap();
+        assert_eq!(plan["plan"]["candidates"].as_array().unwrap().len(), 1);
     }
 }
