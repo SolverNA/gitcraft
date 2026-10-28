@@ -334,6 +334,11 @@ pub(crate) fn client(config: &Value) -> Result<RconClient> {
     })
 }
 fn run_inner(config: &Value, bootstrap: bool) -> Result<Value> {
+    if !bootstrap && !paths(config, "state")?.join("deployment.json").is_file() {
+        bail!(
+            "Server is not managed yet; choose explicit EULA bootstrap for a new stopped server or reviewed adoption for an existing server"
+        );
+    }
     let client = client(config)?;
     run_transaction(
         config,
@@ -369,6 +374,11 @@ pub(crate) fn run_transaction(
     } else {
         json!({})
     };
+    if !bootstrap && !state_file.is_file() {
+        bail!(
+            "Server is not managed yet; choose explicit bootstrap or reviewed adoption; empty RCON is not initial deployment permission"
+        );
+    }
     let name = text(config, "deployment", "service")?;
     if bootstrap {
         if state_file.exists() {
@@ -621,12 +631,19 @@ fn execute_with(
                 || crate::transfer::has_pending(config)?
             {
                 "recovery_required"
+            } else if !state.join("deployment.json").is_file() {
+                "initialization_required"
             } else {
                 "error"
             };
+            let message = if status == "initialization_required" {
+                "Choose explicit EULA bootstrap for a new stopped server or reviewed adoption for an existing server; regular polling cannot initialize ownership."
+            } else {
+                "Deployment failed; inspect durable journal. Recovery never restarts Minecraft automatically."
+            };
             atomic_json(
                 &state.join("status.json"),
-                &json!({"status":status,"message":"Deployment failed; inspect durable journal. Recovery never restarts Minecraft automatically.","timestamp":timestamp()}),
+                &json!({"status":status,"message":message,"timestamp":timestamp()}),
             )?;
         }
     }
@@ -983,6 +1000,37 @@ mod integration_tests {
         }
     }
     use sha2::Digest;
+    #[test]
+    fn unadopted_empty_running_server_is_never_implicitly_initialized() {
+        let mut fixture = Fixture::new();
+        fs::remove_file(fixture.runtime.state.join("deployment.json")).unwrap();
+        assert!(
+            run_transaction(
+                &fixture.config,
+                false,
+                &fixture.client,
+                &mut fixture.runtime
+            )
+            .is_err()
+        );
+        assert!(fixture.runtime.active);
+        assert!(fixture.runtime.actions.is_empty());
+        assert_eq!(
+            fs::read_to_string(
+                paths(&fixture.config, "server")
+                    .unwrap()
+                    .join("world/level.dat")
+            )
+            .unwrap(),
+            "world"
+        );
+        assert_eq!(
+            fs::read_to_string(paths(&fixture.config, "server").unwrap().join("server.jar"))
+                .unwrap(),
+            "old jar"
+        );
+        assert!(!fixture.runtime.state.join("deployment.json").exists());
+    }
     #[test]
     fn adopted_engine_rename_rejected_before_stop() {
         let mut fixture = Fixture::new();
