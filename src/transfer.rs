@@ -40,6 +40,8 @@ struct Session {
     chunks: Vec<Vec<String>>,
     verified: bool,
     status: String,
+    #[serde(default)]
+    destination: Option<Value>,
 }
 
 fn now() -> u64 {
@@ -145,6 +147,52 @@ fn data(dir: &Path, index: usize) -> Result<PathBuf> {
 }
 fn save(dir: &Path, s: &Session) -> Result<()> {
     atom(&dir.join("session.json"), s)
+}
+fn destination_binding(config: &Value) -> Result<Value> {
+    let mut result = serde_json::Map::new();
+    for key in ["server", "cache", "backups", "state"] {
+        let path = Path::new(
+            config["paths"][key]
+                .as_str()
+                .context("destination path missing")?,
+        );
+        ensure!(
+            path.is_absolute() && !path.components().any(|c| matches!(c, Component::ParentDir)),
+            "destination must be a validated absolute path"
+        );
+        crate::deploy::safe_path(path, ".binding-check")?;
+        let normalized: PathBuf = path.components().collect();
+        result.insert(key.into(), json!(normalized));
+    }
+    result.insert("service".into(), config["deployment"]["service"].clone());
+    result.insert(
+        "transfers".into(),
+        json!(root(config)?.components().collect::<PathBuf>()),
+    );
+    Ok(Value::Object(result))
+}
+fn check_destination(config: &Value, session: &Session) -> Result<()> {
+    let expected=session.destination.as_ref().context("legacy transfer session has no destination binding; create a new session or clean it up after any required recovery")?;
+    ensure!(
+        *expected == destination_binding(config)?,
+        "transfer destination or service changed; restore original settings for recovery or create a new session"
+    );
+    Ok(())
+}
+pub fn has_active_sessions(config: &Value) -> Result<bool> {
+    let base = root(config)?;
+    for dir in session_entries(&base)? {
+        let s = match raw_session(&dir) {
+            Ok(s) => s,
+            Err(_) => return Ok(true),
+        };
+        if ["receiving", "verified", "recovery_required"].contains(&s.status.as_str())
+            || (dir.join("journal.json").exists() && s.status != "committed")
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 pub fn has_pending(config: &Value) -> Result<bool> {
     for entry in fs::read_dir(root(config)?)? {
@@ -320,6 +368,7 @@ fn staged_bytes(path: &Path) -> Result<u64> {
 pub fn create(config: &Value, manifest: Manifest) -> Result<Value> {
     let bytes = validate_manifest(config, &manifest)?;
     let base = root(config)?;
+    let destination = Some(destination_binding(config)?);
     let _guard = lock(&base.join("create.lock"))?;
     capacity(config, &base, bytes)?;
     let id = random();
@@ -343,6 +392,7 @@ pub fn create(config: &Value, manifest: Manifest) -> Result<Value> {
         chunks: vec![vec![]; count],
         verified: false,
         status: "receiving".into(),
+        destination,
     };
     for index in 0..count {
         File::create(data(&dir, index)?)?.sync_all()?;
@@ -503,6 +553,7 @@ pub(crate) fn commit_with(
     let dir = session_dir(config, id)?;
     let _session = lock(&dir.join("session.lock"))?;
     let (_, mut s) = load(config, id, token)?;
+    check_destination(config, &s)?;
     if s.status == "committed" {
         return Ok(
             json!({"id":id,"status":"committed","receipt":serde_json::from_slice::<Value>(&fs::read(dir.join("receipt.json"))?)?}),
@@ -609,7 +660,7 @@ pub(crate) fn commit_with(
         .collect();
     File::open(server)?.sync_all()?;
     File::open(backups)?.sync_all()?;
-    let mut journal = json!({"phase":"prepared","worlds":worlds,"existing":existing,"backup":backup,"stage":stage,"artifacts":receipts});
+    let mut journal = json!({"phase":"prepared","worlds":worlds,"existing":existing,"backup":backup,"stage":stage,"artifacts":receipts,"destination":s.destination});
     atom(&dir.join("journal.json"), &journal)?;
     stopped()?;
     let applied = (|| -> Result<()> {
@@ -645,14 +696,58 @@ pub(crate) fn commit_with(
 }
 
 pub fn recover(config: &Value, id: &str, token: &str) -> Result<Value> {
+    recover_with(config, id, token, || crate::deploy::ensure_stopped(config))
+}
+fn recover_with(
+    config: &Value,
+    id: &str,
+    token: &str,
+    stopped: impl Fn() -> Result<()>,
+) -> Result<Value> {
     let dir = session_dir(config, id)?;
     let _session = lock(&dir.join("session.lock"))?;
     // Recovery credentials remain valid for an interrupted journal even after upload TTL.
     let (_, mut s) = load_inner(config, id, token, true)?;
+    if s.destination.is_some() {
+        check_destination(config, &s)?;
+    }
     let state = Path::new(config["paths"]["state"].as_str().context("state missing")?);
     let _deploy = lock(&state.join("deploy.lock"))?;
-    crate::deploy::ensure_stopped(config)?;
     let journal: Value = serde_json::from_slice(&fs::read(dir.join("journal.json"))?)?;
+    // Legacy journals have no session binding. Their exact recorded paths are
+    // the only safe migration proof; never guess a target from new settings.
+    let expected_stage = crate::deploy::safe_path(
+        Path::new(
+            config["paths"]["server"]
+                .as_str()
+                .context("server missing")?,
+        ),
+        &format!("gitcraft-transfer-{id}"),
+    )?;
+    let expected_backup = crate::deploy::safe_path(
+        Path::new(
+            config["paths"]["backups"]
+                .as_str()
+                .context("backups missing")?,
+        ),
+        &format!("world-transfer-{id}"),
+    )?;
+    ensure!(
+        journal["stage"]
+            .as_str()
+            .is_some_and(|p| Path::new(p) == expected_stage)
+            && journal["backup"]
+                .as_str()
+                .is_some_and(|p| Path::new(p) == expected_backup),
+        "recovery journal paths do not match the original destination; restore original settings or inspect the recorded backups manually; no files were restored"
+    );
+    if let Some(binding) = journal.get("destination").filter(|v| !v.is_null()) {
+        ensure!(
+            *binding == destination_binding(config)?,
+            "world journal destination differs from current settings; restore original settings before recovery"
+        );
+    }
+    stopped()?;
     if journal["phase"] == "committed" {
         let receipt = json!({"worlds":journal["worlds"],"backup":journal["backup"],"artifacts":journal["artifacts"],"files":s.manifest.files,"committed":now()});
         atom(&dir.join("receipt.json"), &receipt)?;
@@ -1570,5 +1665,86 @@ mod tests {
         assert_eq!(plan["plan"]["protected"].as_array().unwrap().len(), 1);
         cleanup_apply(&c, plan["digest"].as_str().unwrap(), true).unwrap();
         assert!(orphan.join("data/0").exists());
+    }
+    #[test]
+    fn destination_change_rejects_commit_and_original_binding_still_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = config(dir.path());
+        fs::create_dir_all(dir.path().join("server")).unwrap();
+        fs::create_dir_all(dir.path().join("backups")).unwrap();
+        let s = create(&c, manifest(b"new")).unwrap();
+        let id = s["id"].as_str().unwrap();
+        let token = s["token"].as_str().unwrap();
+        chunk(&c, id, token, 0, 0, &hash(b"new"), b"new").unwrap();
+        verify(&c, id, token).unwrap();
+        assert!(has_active_sessions(&c).unwrap());
+        let mut changed = c.clone();
+        changed["paths"]["server"] = json!(dir.path().join("different-server"));
+        assert!(commit_with(&changed, id, token, true, || Ok(())).is_err());
+        assert!(!dir.path().join("different-server").exists());
+        assert!(!dir.path().join("server/world").exists());
+        let mut changed = c.clone();
+        changed["deployment"]["service"] = json!("different.service");
+        assert!(commit_with(&changed, id, token, true, || Ok(())).is_err());
+        commit_with(&c, id, token, true, || Ok(())).unwrap();
+        assert_eq!(
+            fs::read(dir.path().join("server/world/level.dat")).unwrap(),
+            b"new"
+        );
+        assert!(!has_active_sessions(&c).unwrap());
+    }
+    #[test]
+    fn recovery_rejects_changed_destination_and_legacy_recovery_requires_exact_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = config(dir.path());
+        fs::create_dir_all(dir.path().join("server/world")).unwrap();
+        fs::create_dir_all(dir.path().join("backups")).unwrap();
+        fs::write(dir.path().join("server/world/level.dat"), b"old").unwrap();
+        let s = create(&c, manifest(b"new")).unwrap();
+        let id = s["id"].as_str().unwrap();
+        let token = s["token"].as_str().unwrap();
+        chunk(&c, id, token, 0, 0, &hash(b"new"), b"new").unwrap();
+        verify(&c, id, token).unwrap();
+        let calls = std::cell::Cell::new(0);
+        assert!(
+            commit_with(&c, id, token, true, || {
+                calls.set(calls.get() + 1);
+                if calls.get() == 3 {
+                    bail!("crash after replacing worlds");
+                }
+                Ok(())
+            })
+            .is_err()
+        );
+        assert_eq!(
+            fs::read(dir.path().join("server/world/level.dat")).unwrap(),
+            b"new"
+        );
+        let mut changed = c.clone();
+        changed["paths"]["server"] = json!(dir.path().join("wrong-server"));
+        assert!(recover_with(&changed, id, token, || Ok(())).is_err());
+        assert!(!dir.path().join("wrong-server").exists());
+        let sessiondir = session_dir(&c, id).unwrap();
+        let mut state = raw_session(&sessiondir).unwrap();
+        state.destination = None;
+        save(&sessiondir, &state).unwrap();
+        assert!(commit_with(&c, id, token, true, || Ok(())).is_err());
+        let journalpath = sessiondir.join("journal.json");
+        let mut journal: Value = serde_json::from_slice(&fs::read(&journalpath).unwrap()).unwrap();
+        journal.as_object_mut().unwrap().remove("destination");
+        let original = journal.clone();
+        journal["stage"] = json!(dir.path().join("wrong-stage"));
+        atom(&journalpath, &journal).unwrap();
+        assert!(recover_with(&c, id, token, || Ok(())).is_err());
+        assert_eq!(
+            fs::read(dir.path().join("server/world/level.dat")).unwrap(),
+            b"new"
+        );
+        atom(&journalpath, &original).unwrap();
+        recover_with(&c, id, token, || Ok(())).unwrap();
+        assert_eq!(
+            fs::read(dir.path().join("server/world/level.dat")).unwrap(),
+            b"old"
+        );
     }
 }
