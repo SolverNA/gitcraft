@@ -237,6 +237,11 @@ pub fn backups(config: &Value) -> Result<Value> {
             if path.is_dir() {
                 let receipt = path.join("data-backup.json");
                 if receipt.exists() {
+                    crate::deploy::safe_path(&path, "data-backup.json")?;
+                    ensure!(
+                        receipt.metadata()?.len() < 4 * 1024 * 1024,
+                        "Backup receipt exceeds list limit"
+                    );
                     let bytes = fs::read(&receipt)?;
                     ensure!(
                         bytes.len() < 4 * 1024 * 1024,

@@ -344,15 +344,36 @@ fn has_operational_data(path: &Path, metadata: bool) -> Result<bool> {
     Ok(false)
 }
 pub fn operational_change(current: &Value, proposed: &Value) -> Result<()> {
+    let path_change = current["paths"] != proposed["paths"];
+    let connection_change = ["url", "branch", "authoring_path"]
+        .iter()
+        .any(|key| current["repository"][key] != proposed["repository"][key]);
+    let sensitive = path_change
+        || connection_change
+        || current["deployment"]["service"] != proposed["deployment"]["service"]
+        || current["rcon"] != proposed["rcon"]
+        || current["secrets"] != proposed["secrets"];
+    if path_change || current["deployment"]["service"] != proposed["deployment"]["service"] {
+        let sessions = crate::transfer::list_sessions(current)?;
+        if sessions["cleanup_pending"] == true
+            || sessions["sessions"].as_array().is_some_and(|sessions| {
+                sessions.iter().any(|session| {
+                    !["committed", "cancelled"].contains(&session["status"].as_str().unwrap_or(""))
+                })
+            })
+        {
+            bail!(
+                "Active, verified or recovery transfer sessions bind the current managed paths; finish/cancel and review cleanup before changing destinations"
+            );
+        }
+    }
     if current["paths"] != proposed["paths"]
         || current["deployment"]["service"] != proposed["deployment"]["service"]
         || current["rcon"] != proposed["rcon"]
     {
         crate::deploy::ensure_stopped(current)?;
     }
-    if current["repository"] != proposed["repository"]
-        && let Ok(repo) = crate::repository::authoring_repository(current)
-    {
+    if connection_change && let Ok(repo) = crate::repository::authoring_repository(current) {
         let pending = crate::repository::proposal_status(&repo)?;
         if ["local_verified", "pushed", "pr_pending", "retry_blocked"]
             .contains(&pending["status"].as_str().unwrap_or(""))
@@ -396,7 +417,9 @@ pub fn operational_change(current: &Value, proposed: &Value) -> Result<()> {
     {
         bail!("Credential store cannot be moved by changing settings");
     }
-    if crate::recovery::pending(current)?.is_some() || crate::transfer::has_pending(current)? {
+    if sensitive
+        && (crate::recovery::pending(current)?.is_some() || crate::transfer::has_pending(current)?)
+    {
         bail!("Recovery is pending; settings cannot orphan the existing transaction");
     }
     Ok(())
@@ -488,7 +511,7 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), bytes);
     }
     #[test]
-    fn pending_recovery_blocks_even_non_path_settings() {
+    fn pending_recovery_blocks_connection_but_allows_web_limits() {
         let root = tempfile::tempdir().unwrap();
         let mut value = sample();
         for key in [
@@ -506,7 +529,47 @@ mod tests {
         fs::create_dir_all(state).unwrap();
         fs::write(state.join("transaction.json"), "{}").unwrap();
         let mut proposed = value.clone();
-        proposed["repository"]["poll_interval_seconds"] = json!(33);
+        proposed["repository"]["branch"] = json!("release");
         assert!(operational_change(&value, &proposed).is_err());
+        let mut proposed = value.clone();
+        proposed["web"]["port"] = json!(8766);
+        proposed["transfer"]["max_files"] = json!(2000);
+        assert!(operational_change(&value, &proposed).is_ok());
+    }
+    #[test]
+    fn receiving_session_rejects_destination_changes_but_not_limits() {
+        let root = tempfile::tempdir().unwrap();
+        let mut value = sample();
+        for key in [
+            "repository",
+            "server",
+            "state",
+            "cache",
+            "staging",
+            "backups",
+        ] {
+            value["paths"][key] = json!(root.path().join(key));
+        }
+        let value = validate(value).unwrap();
+        crate::transfer::create(
+            &value,
+            crate::transfer::Manifest {
+                files: vec![crate::transfer::TransferFile {
+                    kind: "world".into(),
+                    path: "OurRealm/level.dat".into(),
+                    size: 1,
+                    sha256: "a".repeat(64),
+                }],
+                source_consistency: "stopped".into(),
+            },
+        )
+        .unwrap();
+        let mut proposed = value.clone();
+        proposed["paths"]["cache"] = json!(root.path().join("new-cache"));
+        let error = operational_change(&value, &proposed).unwrap_err();
+        assert!(error.to_string().contains("sessions"));
+        let mut proposed = value.clone();
+        proposed["transfer"]["max_files"] = json!(2000);
+        assert!(operational_change(&value, &proposed).is_ok());
     }
 }
