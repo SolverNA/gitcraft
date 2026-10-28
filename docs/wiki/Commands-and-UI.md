@@ -7,6 +7,7 @@
 | `validate --repository PATH` | Общий policy, tracked audit, синтаксис и manifests |
 | `export plan/apply` | Локальная выборка конфигов с preview |
 | `propose --repository PATH --base BRANCH --title TEXT` | Commit в новую ветку и PR |
+| `agent-activate --config FILE` | Подтверждённая повторная активация установленного poller после успешного init |
 | `agent --config FILE [--once]` | Постоянный poll или один reconciliation |
 | `deploy --config FILE` | Одна обычная попытка с проверкой игроков |
 | `config-show --config FILE` | Полный config и revision без значений secrets |
@@ -39,4 +40,4 @@ UI — оболочка над теми же Rust operations и текстовы
 
 Основные файлы `paths.state`: `deployment.json` (последний успешный commit/ownership), `status.json`, `transaction.json` (незавершенный deploy), `last-transaction.json`, scoped transfer sessions. Не удаляйте state ради обхода ошибки. Потеря ownership может привести к тому, что удаленный из Git старый plugin останется на диске.
 
-В `/operations` находятся полные валидируемые settings, отдельная write-only форма credentials, EULA bootstrap, pending recovery, backup create/list и PR retry. Состояния фоновых операций: running/completed/rejected/error/recovery_required; HTTP202 не обещает завершения. [Подробный цикл](Operations.md).
+В `/operations` находятся полные валидируемые settings, отдельная write-only форма credentials, EULA bootstrap, pending recovery, backup create/list и PR retry. Состояния фоновых операций: running/completed/rejected/error/recovery_required/activation_required; HTTP202 не обещает завершения. [Подробный цикл](Operations.md).

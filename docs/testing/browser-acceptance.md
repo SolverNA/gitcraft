@@ -65,3 +65,20 @@ a JavaScript simulation.
 
 Tests live in [tests/browser](../../tests/browser/README.md); lifecycle and
 integrity regressions also run in `cargo test --locked`.
+
+## HTTP initialization and automatic polling regression
+
+`cargo test --locked activation_acceptance` additionally exercises successful
+bootstrap and reviewed adoption through the real HTTP login/CSRF/background or
+reviewed-plan routes. A test-only external-operation provider uses the same
+post-initialization activation orchestration and the shared production polling
+scheduler. It records actual enabled/active fixture-manager state, merges a new
+commit into a temporary deployment branch, and verifies its exact SHA is picked
+up by the running poller. A second scenario refuses activation after durable
+initialization, observes `activation_required`, then retries activation without
+repeating initialization and observes the next merge.
+
+This is Rust HTTP acceptance, not an additional Chromium scenario. Privileged
+systemd/D-Bus, RCON and JVM boundaries are deterministic fixtures; Git and file
+operations and the polling scheduler are real. No host service is enabled and
+no live Minecraft/VPS deployment is claimed.

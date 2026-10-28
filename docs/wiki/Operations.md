@@ -47,3 +47,16 @@ gitcraft resume --config /etc/gitcraft/config/agent.yml --acknowledge-data-risk
 ```
 
 `config-show` возвращает config object и revision, без значений secrets. `--input` принимает сам config object, не wrapper с revision. `credential-set` читает секрет из **stdin**, не argv; запускайте от service UID с доступом к private provider, не создавайте root-owned store, который сервис не сможет прочитать. CLI не заменяет проверку прав хоста или обязательность review.
+
+
+## Включение автоматических обновлений после инициализации
+
+Успешные `bootstrap` и `adopt apply` сохраняют владение установленной сборкой, освобождают deploy lock и затем пытаются включить и запустить **только установленный стандартный** `gitcraft-agent.service`. Это общий путь CLI и панели. Сервис проверяет Git постоянно с `repository.poll_interval_seconds`; Web UI сам не заменяет poller.
+
+В `/operations` и статусе панели показаны отдельно фактические `active` и `enabled`. `unknown` означает невозможность подтвердить состояние, а не выключенный сервис. Если Minecraft инициализирован, но активация отказала, результат — `partial_success`, состояние операции — `activation_required`, с сохранённым `initialized: true`. Не повторяйте bootstrap/adopt: исправьте указанную причину и нажмите подтверждаемое включение агента в `/operations` либо выполните:
+
+```sh
+gitcraft agent-activate --config /etc/gitcraft/config/agent.yml
+```
+
+Активация сверяет installed config, владельца и точный стандартный root-owned unit/бинарник, отсутствие recovery и сохранённое состояние инициализации. Она не переписывает произвольные units. Для старой установки может потребоваться системное обновление узкого sudoers-разрешения установщиком: браузер не получает произвольный root shell. Локальный/custom config, не соответствующий установленному стандартному сервису, показывает причину отказа; запуск Minecraft не выдаётся за включённую автоматизацию. Успех подтверждается только наблюдаемыми `active` и постоянным `enabled`.
