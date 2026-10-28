@@ -54,3 +54,17 @@ test('operations full settings review, private credential rotation, backup and g
   fs.mkdirSync(path.join(f.paths.server,'world'),{recursive:true});fs.writeFileSync(path.join(f.paths.server,'world','level.dat'),'offline-world-data');await page.goto(`${f.endpoint}/operations`);const backup=page.locator('form[action="/operation/backup"]');await backup.locator('textarea[name=include]').fill('world');await backup.locator('input[name=confirmed]').check();await backup.locator('button').click();await expect.poll(()=>JSON.parse(fs.readFileSync(op)).status).toBe('completed');expect(fs.readdirSync(f.paths.backups).some(n=>n.startsWith('data-'))).toBeTruthy();
   await page.goto(`${f.endpoint}/operations`);const credential=page.locator('form[action="/credential-save"]');const newToken='rotated-real-browser-login-token-long-enough';await credential.locator('select[name=role]').selectOption('web');await credential.locator('input[name=secret]').fill(newToken);await credential.locator('input[name=confirmed]').check();await credential.locator('button').click();await expect(page.locator('body')).not.toContainText(newToken);await page.goto(`${f.endpoint}/operations`);await expect(page.locator('body')).toContainText('Login');await login(page,f,newToken);await expect(page.locator('body')).not.toContainText(newToken);
 });
+test('Minecraft boot policy requires an explicit choice and confirmation and fails safely without installed proof',async({page})=>{
+  await login(page,f);await page.goto(`${f.endpoint}/operations`);
+  await expect(page.locator('#minecraft-autostart')).toContainText('UnitFileState');
+  const form=page.locator('form[action="/operation/minecraft-autostart"]');
+  expect(await form.locator('select[name=policy]').inputValue()).toBe('');
+  const csrf=await form.locator('input[name=csrf]').inputValue();
+  let response=await page.request.post(`${f.endpoint}/operation/minecraft-autostart`,{form:{csrf,policy:'enabled'}});expect(response.status()).toBe(400);
+  response=await page.request.post(`${f.endpoint}/operation/minecraft-autostart`,{form:{csrf,confirmed:'yes',policy:'arbitrary'}});expect(response.status()).toBe(400);
+  expect(fs.existsSync(path.join(f.paths.state,'boot-policy.json'))).toBeFalsy();
+  await form.locator('select[name=policy]').selectOption('enabled');await form.locator('input[name=confirmed]').check();await form.locator('button').click();
+  const op=path.join(f.paths.state,'ui-operation.json');await expect.poll(()=>fs.existsSync(op)?JSON.parse(fs.readFileSync(op)).status:'absent').toBe('rejected');
+  const calls=path.join(f.root,'service-calls');expect(fs.existsSync(calls)?fs.readFileSync(calls,'utf8'):'').not.toContain(' enable ');
+  await page.goto(`${f.endpoint}/operations`);await expect(page.locator('#minecraft-autostart')).toContainText('Unknown');
+});

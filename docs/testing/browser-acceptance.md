@@ -1,7 +1,7 @@
 # Real browser acceptance — 2026-10-28
 
 Executed locally with **Playwright 1.64.1** and an actual **Chromium
-156.0.8078.4** headless process. Five application scenarios passed. This is
+156.0.8078.4** headless process. Six application scenarios passed. This is
 separate from the faster Node VM handler tests and Rust HTTP/unit tests.
 
 ## Reproduction
@@ -34,7 +34,9 @@ artifacts.
 | Folder transfer and recovery | Select a real directory; abort a later HTTP chunk; observe nonzero progress/error; reload and reselect files; retain the same session/token and resume committed offsets without creating another session. Verify whole files; refuse unconfirmed/live-world replacement; replace a stopped fixture world with backup. Inject a prepared journal, refuse recovery while active, then restore the original files while stopped. Cancel the session and explicitly review/apply cleanup. |
 | JAR file transfer | Select a real temporary JAR-named fixture file; verify and import its exact bytes; preview/review/apply cleanup; prove the imported SHA-addressed cache and cache receipt remain. Rust regression additionally loads a transfer manifest and successfully resolves/verifies this cache after session removal. |
 | Config and PR retry | Open an approved config, reject a secret without echoing it, edit text containing a script/textarea payload, inspect escaped real diff, explicitly save only the authoring clone. Publish a review branch to a local bare Git origin; fail the first fake GitHub PR call; retry the same immutable branch/commit without a new push; keep deployment branch unchanged. |
+| Explicit Minecraft boot policy | Observe the separate actual/desired boot-policy panel; require an initially unselected policy and explicit confirmation; reject unsupported choices; safely refuse enabling an uninitialized/unproved installation without issuing a service-enable operation. |
 | Operational controls | Preview all scalar settings and change polling through the form, prove config is unchanged before review, apply the reviewed settings, rotate a write-only Web token and invalidate the old login, create an offline fixture-world backup, enforce EULA consent and report a guarded bootstrap refusal for an unavailable fixture unit. |
+| Minecraft boot policy | Observe distinct actual/desired boot state and an initially unselected policy; reject missing confirmation and unsupported values; confirm enabled choice, then report the guarded refusal on an uninitialized fixture without enabling any host service. Successful policy changes/reboot and maintenance persistence are covered separately by Rust HTTP/runtime fixtures. |
 
 Folder selection uses Chromium's real file input support documented by
 [Playwright's locator API](https://playwright.dev/docs/api/class-locator#locator-set-input-files).
@@ -82,3 +84,5 @@ This is Rust HTTP acceptance, not an additional Chromium scenario. Privileged
 systemd/D-Bus, RCON and JVM boundaries are deterministic fixtures; Git and file
 operations and the polling scheduler are real. No host service is enabled and
 no live Minecraft/VPS deployment is claimed.
+
+The explicit Minecraft boot-policy update was checked with all six Chromium scenarios passing (9.7 seconds). The Rust HTTP fixture additionally models enabled-unit reboot startup, durable maintenance boot suspension, unchanged and newly merged Git reconciliation during the hold, and explicit resume preserving the desired policy. See [poller and boot-policy acceptance](poller-activation-acceptance.md) for exact test boundaries.

@@ -36,7 +36,7 @@ fn reply(stream: &mut TcpStream, id: i32, kind: i32, text: &str) {
     stream.write_all(&[0, 0]).unwrap();
 }
 #[test]
-fn maintenance_stop_refuses_players_and_saves_before_explicit_empty_stop() {
+fn maintenance_stop_refuses_players_and_uninitialized_empty_server() {
     use std::os::unix::fs::PermissionsExt;
     let root = tempfile::tempdir().unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -117,17 +117,13 @@ fn maintenance_stop_refuses_players_and_saves_before_explicit_empty_stop() {
     assert!(!rejected.status.success());
     assert!(!log.exists());
     online.store(0, Ordering::SeqCst);
-    let successful = command();
+    let uninitialized = command();
+    assert!(!uninitialized.status.success());
+    assert!(String::from_utf8_lossy(&uninitialized.stderr).contains("bootstrap or adoption"));
     assert!(
-        successful.status.success(),
-        "{}",
-        String::from_utf8_lossy(&successful.stderr)
+        !log.exists(),
+        "Uninitialized server must not be stopped or have its boot policy changed"
     );
-    let value: serde_json::Value = serde_json::from_slice(&successful.stdout).unwrap();
-    assert_eq!(value["status"], "completed");
-    let actions = fs::read_to_string(log).unwrap();
-    assert!(actions.contains("stop minecraft.service"));
-    assert!(actions.contains("is-active minecraft.service"));
     stopped.store(true, Ordering::Relaxed);
     server.join().unwrap();
 }

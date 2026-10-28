@@ -400,12 +400,24 @@ fn scenario(adopt: bool, activation_fails: bool) {
         reconciles: Arc::new(AtomicUsize::new(0)),
         worker: Mutex::new(None),
     });
+    let enabled = Arc::new(AtomicBool::new(adopt));
     let runner: Arc<crate::web::OperationRunner> = {
+        let enabled = enabled.clone();
         let poller = poller.clone();
         let unit = unit.clone();
         Arc::new(move |config, name, form: &HashMap<String, String>| {
             let mut activation = Activation(poller.clone());
             match name {
+                "minecraft-autostart" | "stop" | "resume" => boot_operation(
+                    config,
+                    name,
+                    form,
+                    &mut BootRuntime {
+                        runtime: poller.runtime.clone(),
+                        enabled: enabled.clone(),
+                        unit: unit.clone(),
+                    },
+                ),
                 "bootstrap" => {
                     ensure!(
                         form.get("accept_eula").is_some_and(|v| v == "yes"),
@@ -475,7 +487,7 @@ fn scenario(adopt: bool, activation_fails: bool) {
     let state = Path::new(config["paths"]["state"].as_str().unwrap());
     wait(
         || {
-            ["completed", "activation_required"].contains(
+            ["completed", "activation_required", "setup_required"].contains(
                 &read_json(&state.join("ui-operation.json"))["status"]
                     .as_str()
                     .unwrap_or(""),
@@ -484,13 +496,18 @@ fn scenario(adopt: bool, activation_fails: bool) {
         "initialization HTTP outcome",
     );
     let outcome = read_json(&state.join("ui-operation.json"));
+    assert_eq!(
+        enabled.load(Ordering::SeqCst),
+        adopt,
+        "Initialization must preserve existing boot policy"
+    );
     assert_eq!(read_json(&state.join("deployment.json"))["commit"], initial);
     assert_eq!(
         outcome["status"],
         if activation_fails {
             "activation_required"
         } else {
-            "completed"
+            "setup_required"
         },
         "{outcome}"
     );
@@ -531,10 +548,12 @@ fn scenario(adopt: bool, activation_fails: bool) {
             .unwrap()
             .contains("motd=approved-second")
     );
-    wait(
-        || read_json(&state.join("ui-operation.json"))["status"] == "completed",
-        "activation completion",
-    );
+    if activation_fails {
+        wait(
+            || read_json(&state.join("ui-operation.json"))["status"] == "completed",
+            "activation completion",
+        );
+    }
     let attempts = poller.attempts.load(Ordering::SeqCst);
     assert_eq!(
         http.post("/operation/agent-activate", &[("confirmed", "yes")])
@@ -555,6 +574,16 @@ fn scenario(adopt: bool, activation_fails: bool) {
         || poller.reconciles.load(Ordering::SeqCst) > count,
         "scheduler config reload",
     );
+    if !adopt && !activation_fails {
+        boot_policy_and_maintenance_acceptance(
+            &http,
+            &config,
+            &repo,
+            &runtime,
+            &enabled,
+            &poller.reconciles,
+        );
+    }
     drop(http);
     drop(poller);
 }
@@ -621,4 +650,212 @@ fn shared_scheduler_reloads_configured_interval_without_restart() {
     );
     assert!(observed[1].0.duration_since(observed[0].0) >= Duration::from_secs(1));
     assert!(observed[2].0.duration_since(observed[1].0) >= Duration::from_secs(2));
+}
+
+#[derive(Clone)]
+struct BootRuntime {
+    runtime: Arc<Mutex<Runtime>>,
+    enabled: Arc<AtomicBool>,
+    unit: Value,
+}
+impl crate::minecraft_autostart::Runtime for BootRuntime {
+    fn inspect(&mut self, _: &Value) -> Result<Value> {
+        let mut unit = self.unit.clone();
+        unit["ActiveState"] = json!(if self.runtime.lock().unwrap().active {
+            "active"
+        } else {
+            "inactive"
+        });
+        unit["UnitFileState"] = json!(if self.enabled.load(Ordering::SeqCst) {
+            "enabled"
+        } else {
+            "disabled"
+        });
+        Ok(unit)
+    }
+    fn trusted_installation(&mut self, _: &Value, _: &Value) -> Result<()> {
+        Ok(())
+    }
+    fn change(&mut self, _: &Value, policy: &str) -> Result<()> {
+        ensure!(
+            ["enabled", "disabled"].contains(&policy),
+            "Invalid boot policy"
+        );
+        self.enabled.store(policy == "enabled", Ordering::SeqCst);
+        Ok(())
+    }
+}
+fn boot_operation(
+    config: &Value,
+    name: &str,
+    form: &HashMap<String, String>,
+    boot: &mut BootRuntime,
+) -> Result<Value> {
+    use deploy::Runtime as _;
+    match name {
+        "minecraft-autostart" => crate::minecraft_autostart::set_with(
+            config,
+            &form["policy"],
+            form.get("confirmed").is_some_and(|v| v == "yes"),
+            boot,
+        ),
+        "stop" => {
+            let runtime = boot.runtime.clone();
+            let stopruntime = runtime.clone();
+            crate::minecraft_autostart::maintenance_with(
+                config,
+                boot,
+                move || {
+                    let mut runtime = runtime.lock().unwrap();
+                    ensure!(runtime.online()? == 0, "Players online");
+                    runtime.command("save-all flush")?;
+                    Ok(())
+                },
+                move || {
+                    stopruntime
+                        .lock()
+                        .unwrap()
+                        .service("stop", "minecraft.service")?;
+                    Ok(())
+                },
+            )
+        }
+        "resume" => {
+            let runtime = boot.runtime.clone();
+            crate::minecraft_autostart::resume_with(config, boot, move || {
+                let mut runtime = runtime.lock().unwrap();
+                runtime.service("start", "minecraft.service")?;
+                runtime.healthy("minecraft.service", 1)?;
+                Ok(json!({"status":"completed"}))
+            })
+        }
+        _ => anyhow::bail!("Unsupported boot fixture operation"),
+    }
+}
+fn completed_http_operation(
+    http: &HttpFixture,
+    state: &Path,
+    route: &str,
+    fields: &[(&str, &str)],
+) {
+    // The live poller legitimately owns the nonblocking deploy lock sometimes.
+    // Retry only that explicit conflict through HTTP; never hide policy/safety failures.
+    for _ in 0..10 {
+        assert_eq!(http.post(route, fields).0, 202);
+        wait(
+            || read_json(&state.join("ui-operation.json"))["status"] != "running",
+            "boot operation outcome",
+        );
+        let outcome = read_json(&state.join("ui-operation.json"));
+        if outcome["status"] == "completed" {
+            return;
+        }
+        assert_eq!(
+            outcome["result"]["message"], "Another deployment is running",
+            "{outcome}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    panic!("Live reconciliation did not release the operation lock");
+}
+fn boot_policy_and_maintenance_acceptance(
+    http: &HttpFixture,
+    config: &Value,
+    repo: &Path,
+    runtime: &Arc<Mutex<Runtime>>,
+    enabled: &Arc<AtomicBool>,
+    reconciles: &AtomicUsize,
+) {
+    let state = Path::new(config["paths"]["state"].as_str().unwrap());
+    runtime.lock().unwrap().active = false;
+    runtime.lock().unwrap().actions.clear();
+    assert_eq!(
+        http.post("/operation/minecraft-autostart", &[("policy", "enabled")])
+            .0,
+        400
+    );
+    completed_http_operation(
+        http,
+        state,
+        "/operation/minecraft-autostart",
+        &[("policy", "enabled"), ("confirmed", "yes")],
+    );
+    assert!(enabled.load(Ordering::SeqCst));
+    assert!(
+        !runtime.lock().unwrap().active,
+        "Boot enable must not start the current runtime"
+    );
+    assert!(
+        !runtime
+            .lock()
+            .unwrap()
+            .actions
+            .iter()
+            .any(|action| action == "start")
+    );
+    // Model only systemd's reboot decision: enabled units start, disabled ones do not.
+    runtime.lock().unwrap().active = enabled.load(Ordering::SeqCst);
+    assert!(runtime.lock().unwrap().active);
+    completed_http_operation(http, state, "/operation/stop", &[("confirmed", "yes")]);
+    assert!(!enabled.load(Ordering::SeqCst));
+    assert!(!runtime.lock().unwrap().active);
+    runtime.lock().unwrap().active = enabled.load(Ordering::SeqCst);
+    assert!(!runtime.lock().unwrap().active);
+    runtime.lock().unwrap().actions.clear();
+    let old_commit = read_json(&state.join("deployment.json"))["commit"].clone();
+    let count = reconciles.load(Ordering::SeqCst);
+    wait(
+        || reconciles.load(Ordering::SeqCst) >= count + 2,
+        "unchanged scheduler preserves maintenance hold",
+    );
+    assert!(!runtime.lock().unwrap().active);
+    git(
+        repo,
+        &[
+            "commit",
+            "--allow-empty",
+            "-m",
+            "Approved maintenance-time change",
+        ],
+    );
+    git(repo, &["push", "origin", "release"]);
+    let count = reconciles.load(Ordering::SeqCst);
+    wait(
+        || reconciles.load(Ordering::SeqCst) >= count + 2,
+        "pending merge scheduler preserves maintenance hold",
+    );
+    assert_eq!(
+        read_json(&state.join("deployment.json"))["commit"],
+        old_commit
+    );
+    assert!(!runtime.lock().unwrap().active);
+    assert!(!runtime.lock().unwrap().actions.iter().any(|a| a == "start"));
+    completed_http_operation(
+        http,
+        state,
+        "/operation/resume",
+        &[("confirmed", "yes"), ("acknowledge_data_risk", "yes")],
+    );
+    assert!(enabled.load(Ordering::SeqCst));
+    assert!(runtime.lock().unwrap().active);
+    completed_http_operation(
+        http,
+        state,
+        "/operation/minecraft-autostart",
+        &[("policy", "disabled"), ("confirmed", "yes")],
+    );
+    assert!(!enabled.load(Ordering::SeqCst));
+    completed_http_operation(http, state, "/operation/stop", &[("confirmed", "yes")]);
+    completed_http_operation(
+        http,
+        state,
+        "/operation/resume",
+        &[("confirmed", "yes"), ("acknowledge_data_risk", "yes")],
+    );
+    assert!(!enabled.load(Ordering::SeqCst));
+    runtime.lock().unwrap().active = enabled.load(Ordering::SeqCst);
+    assert!(
+        !runtime.lock().unwrap().active,
+        "Explicit disabled policy must remain disabled after resume/reboot"
+    );
 }
