@@ -37,7 +37,7 @@ cargo test --locked
 - Mappings `server-settings/`, `plugins-configs/`, `config/`, `defaultconfigs/`.
 - HTTPS pins с SHA-256 и отдельные transfer-backed pins с проверенными receipt.
 - Прямой resumable transport: authentication, scoped sessions, chunks, offsets, SHA, квоты, verify и явное подтверждение замены мира.
-- Loopback Web UI: статус, repository/branch onboarding, export/adopt планы, ограниченный approved-config editor с diff/PR из отдельного clone и browser transfer; CLI и YAML остаются доступны.
+- Loopback Web UI: полные guarded settings, write-only credentials, bootstrap/EULA, stop/resume/recovery, offline backup/list, approved-config editor/diff/PR/retry и browser transfer/lifecycle cleanup. CLI и YAML остаются доступны.
 - Настраиваемый poll в долгоживущем systemd agent, RCON fail-closed и межпроцессная блокировка.
 - Durable journal, backup hashes, осознанное stopped recovery после старта новой Java; отдельные offline game-data backups.
 
@@ -46,6 +46,8 @@ cargo test --locked
 | Задача | Страница |
 |---|---|
 | Понять устройство | [Архитектура](docs/wiki/Architecture.md) |
+| Полный цикл без ручного YAML после установки | [Операции панели](docs/wiki/Operations.md) |
+| Сессии: status/cancel/reviewed cleanup | [Lifecycle](docs/wiki/Session-lifecycle.md) |
 | Все поля YAML и квоты | [Конфигурация](docs/wiki/Configuration.md) |
 | Команды и UI | [Справочник](docs/wiki/Commands-and-UI.md) |
 | Миры/JAR и обрыв загрузки | [Перенос](docs/wiki/Transfer.md) |
@@ -75,3 +77,5 @@ bash scripts/test-install.sh
 - После попытки запуска новой Java автоматический downgrade запрещен: данные уже могли мигрировать. [Recovery](docs/wiki/Recovery.md) восстанавливает managed files и оставляет сервис остановленным; мир/БД требуют соответствующей отдельной копии.
 - Browser upload ограничен 64 MiB на файл; более крупные файлы отправляются streaming CLI. Источник должен быть остановлен или быть заранее согласованным snapshot.
 - Retention backup/cache/staging не автоматизирована. Поддерживается управляемый JAR launcher; установка сложных Forge libraries/argfiles не угадывается. Modrinth — поддерживаемый auto-update provider; неизвестные/прочие источники закрепляются вручную.
+
+Браузерная приемка запускается настоящим Playwright/Chromium: `npm ci --ignore-scripts`, `npx playwright install chromium`, `npm run test:browser`. [Покрытие и внешние границы](docs/testing/browser-acceptance.md). Launcher проверяется по точным systemd/busctl argv; env-based и ambiguous units требуют отдельной reviewed migration при системной установке, автоматически не переписываются.

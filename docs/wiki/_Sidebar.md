@@ -1,5 +1,7 @@
 - [GitCraft](Home.md)
 - [Быстрый старт](Quickstart.md)
+- [Полные операции](Operations.md)
+- [Сессии и cleanup](Session-lifecycle.md)
 - [Архитектура](Architecture.md)
 - [Экспорт и policy](Export-and-policy.md)
 - [Конфигурация](Configuration.md)

@@ -1,6 +1,6 @@
 # Локальная конфигурация
 
-`/etc/gitcraft/config/agent.yml` — обычный YAML. UI изменяет те же валидируемые настройки; агент не зависит от панели. Секреты находятся отдельно в root-owned `/etc/gitcraft/secrets.env` (0600), systemd передает их через окружение.
+`/etc/gitcraft/config/agent.yml` — обычный YAML. UI изменяет те же валидируемые настройки; агент не зависит от панели. Первоначальные секреты находятся отдельно в root-owned `/etc/gitcraft/secrets.env` (0600), systemd передает их через окружение. После установки все настройки доступны в `/operations`, а новые credentials задаются write-only формой в private `local-secrets.json` (0600, owned service UID) рядом с agent.yml. Пароль не добавляется в YAML/preview. См. [Полные операции](Operations.md).
 
 ```yaml
 repository:
@@ -28,6 +28,8 @@ web:
   host: 127.0.0.1
   port: 8765
   token_env: GITCRAFT_WEB_TOKEN
+secrets:
+  store_path: "" # вычисляется рядом с agent.yml как local-secrets.json
 transfer:
   max_session_bytes: 107374182400
   max_staging_bytes: 214748364800
@@ -45,8 +47,10 @@ transfer:
 - Шесть `paths`: абсолютные отдельные каталоги, не вложенные друг в друга. Для adopt рабочий server должен точно совпадать с existing unit WorkingDirectory. Не меняйте пути state/cache без миграции соответствующих файлов.
 - `empty_grace_seconds`: как долго проверять отсутствие игроков до остановки.
 - `health_timeout_seconds`: сколько ждать systemd + RCON после старта.
-- `password_env`/`token_env`: имена env, не сами секреты. Web token минимум 24 символа. Fresh installer генерирует случайные значения; adopt использует уже действующий RCON пароль.
+- `password_env`/`token_env`: имена env, не сами секреты. Web token минимум 24 символа. Fresh installer генерирует случайные значения; adopt использует уже действующий RCON пароль. Роль из private provider имеет приоритет над env; пустое значение не сбрасывает существующий пароль. Неисправный store блокирует доступ, не включает молчаливый fallback. RCON rotation только stopped, Web rotation инвалидирует все старые login sessions.
 - Web и RCON client ограничены loopback IP. Это не ограничивает Minecraft listener; firewall настраивается отдельно.
 - `transfer`: квоты сессии, суммарного staging, количества файлов, резерв свободного диска и TTL. Размеры указаны в байтах. Staging quota не меньше session quota. Максимум файлов 1 000 000, TTL не больше 30 дней. Browser upload ограничивает файл 64 MiB; для больших файлов есть CLI с chunks 1 MiB.
 
 Произвольные дополнительные ключи не принимаются. Сохранение конфига атомарное, файл имеет 0600. Настройки systemd sandboxes и sudoers должны соответствовать выбранным путям/имени сервиса; изменение YAML само по себе не выдает новые системные права.
+
+Изменение путей/service/RCON требует stopped maintenance; непустые managed roots и pending ownership/transfer/proposal не перемещаются автоматически. Web/limits можно менять без потери unrelated сессий. Сохранение проходит preview/review и compare-and-swap config revision; credential generation также привязана к preview. `secrets.store_path` — закрепленная ссылка на dedicated adjacent provider, а не возможность писать произвольные файлы.

@@ -27,3 +27,5 @@ Sudoers ограничивается конкретными systemctl start/stop
 ## Остаточные риски
 
 Подключение игрока возможно между последним online-check и stop. Миграция данных не откатывается возвратом JAR. Внешняя БД требует собственного согласованного backup. Retention backup/cache/staging пока не автоматизирован; контролируйте диск. Tests с fixtures не заменяют стенд с вашей сборкой.
+
+Local write-only provider принимает только rcon/web роли в dedicated adjacent 0600 file. Проверяются owner, permissions, symlink/hardlink, schema и размер; malformed store не замещается env молча. Preview содержит random generation marker, не password digest. Settings сохраняются с CAS и shared locks; active request нельзя очистить по одному TTL. Destination binding и journal защищают перенос при смене config.

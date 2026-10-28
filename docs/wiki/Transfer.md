@@ -94,3 +94,7 @@ gitcraft transfer recover --endpoint http://127.0.0.1:8765 --session /tmp/world-
 Minecraft оставьте остановленным. Восстановление возвращает сохраненные старые world directories; оно не сливает две истории мира. Смотрите также [Recovery](Recovery.md).
 
 Имя engine в metadata/export, transfer plan и fresh launcher должно совпадать. По умолчанию это `server.jar`; для другого basename используйте `install.sh --engine NAME.jar`, а в metadata `filename` явно укажите то же имя. Existing adopt unit не переименовывается автоматически.
+
+## Управление сессиями и привязка назначения
+
+[Lifecycle](Session-lifecycle.md) позволяет перечислить metadata, отменить idle сессию по ID и освободить staging после preview/review. Новая сессия закрепляет server/cache/backups/state-transfer root и service identity. Активный/verified/recovery перенос блокирует смену этих настроек, backend повторно сверяет binding при commit/recover. Token не разрешает перенести выбранные байты в другой сервер через изменение config. Старую сессию без binding нельзя молча commit: создайте новую. Legacy recovery возможен только при доказанном совпадении записанных stage/backup/current destination; иначе остановитесь и расследуйте.

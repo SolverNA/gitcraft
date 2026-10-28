@@ -54,6 +54,8 @@ Destination не должен существовать. JAR и миры не к�
 - [Пустой VPS](Transfer.md): установка сервиса → закрыть внешний RCON → передать игровые данные и JAR → verify/commit → явный EULA bootstrap.
 - [Уже работающий VPS](Adoption.md): read-only adopt plan → проверка unit/config/JAR/точного SHA → adopt apply. Не запускайте fresh installer поверх существующего unit.
 
+После системной установки полные settings, write-only credentials, bootstrap/EULA, stop/resume/recovery и offline backup доступны в `/operations` через preview/review без ручного YAML. Права Unix/network и actual systemd unit подготавливаются установкой; произвольной browser shell нет. [Полный цикл панели](Operations.md).
+
 ## 5. Повседневное изменение
 
 В отдельном рабочем clone от актуальной deploy-ветки измените одобренный конфиг и выполните:

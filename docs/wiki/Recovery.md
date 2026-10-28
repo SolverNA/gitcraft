@@ -29,7 +29,7 @@ gitcraft backup-data --config /etc/gitcraft/config/agent.yml \
 gitcraft recover --config /etc/gitcraft/config/agent.yml --acknowledge-data-risk
 ```
 
-Команда проверяет hashes managed backup, восстанавливает только управляемые файлы и прежний deployment state. **Мир/БД не восстанавливаются, сервис не запускается.** Отдельно верните соответствующие игровые данные при необходимости, проверьте их и явно запустите existing unit.
+Команда проверяет hashes managed backup, восстанавливает только управляемые файлы и прежний deployment state. **Мир/БД не восстанавливаются, сервис не запускается.** Отдельно верните соответствующие игровые данные при необходимости, проверьте их и используйте Resume в `/operations` или `gitcraft resume --acknowledge-data-risk`. Проверяются launcher, exact installed commit, hashes и stopped state; перед стартом накладывается current local RCON credential.
 
 ## Crash или потеря питания
 
@@ -47,3 +47,5 @@ World transfer использует собственный journal и `transfer 
 ## Хранение
 
 Автоматической retention policy для backups/cache/staging пока нет. Следите за диском, храните нужные восстановления и удаляйте старые копии по собственной политике. Сохраните копию backup вне единственного диска VPS и проверьте восстановление на стенде.
+
+Операционные settings, offline backup/list, stop, EULA bootstrap и recovery доступны в [панели](Operations.md). Нельзя обойти pending journal переносом state path: guard это блокирует. Отмена/cleanup сессий отделена от world recovery и не удаляет pending world journal независимо от TTL.

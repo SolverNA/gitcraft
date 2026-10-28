@@ -35,3 +35,11 @@
 `deploy.lock` защищает от параллельного deploy/adopt/recovery/изменения runtime через transport. Durable journal фиксирует стадии применения и backup hashes. После старта новой Java возможны миграции игровых данных: ошибка readiness оставляет сервер остановленным и требует осознанного восстановления, а не молчаливого downgrade.
 
 Работающий RCON недоступен — это ошибка, а не нулевой онлайн. Период пустого сервера уменьшает вероятность случайного рестарта при переподключении, но не блокирует новый вход между последней проверкой и остановкой.
+
+## Проверяемый launcher и явная инициализация
+
+Перед любым deploy, включая unchanged commit и fresh bootstrap, unit проверяется по структурированным `busctl --json=short`/systemd ExecStartEx данным: точный WorkingDirectory, один direct Java launch и единственный literal `-jar` target, совпадающий с engine pin. Переменные (`$JAVA_OPTS`), wrappers, несколько команд, `@argfiles`, неподдерживаемые flags и неоднозначный argv отвергаются до stop/apply. Нужен поддерживаемый system bus/ExecStartEx; текстовый вывод не считается безопасным fallback.
+
+Fresh template использует explicit `ExecStart=/usr/bin/java -Xms1G -Xmx2G -jar server.jar nogui`. Старые env-based units не переписываются автоматически: владелец отдельно проверяет и мигрирует launcher при системной установке/обслуживании. Панель выбирает уже установленный service, не создает arbitrary unit.
+
+Без verified initial state обычный agent возвращает initialization_required: выберите явный EULA bootstrap либо reviewed adopt. Пустой RCON не разрешает присвоить чужой runtime или начать первый deploy.
