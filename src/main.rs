@@ -68,6 +68,54 @@ enum Command {
         #[arg(long)]
         acknowledge_data_risk: bool,
     },
+    ConfigShow {
+        #[arg(long)]
+        config: PathBuf,
+    },
+    ConfigApply {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        input: PathBuf,
+        #[arg(long)]
+        expected_revision: String,
+        #[arg(long)]
+        reviewed: bool,
+    },
+    CredentialSet {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        role: String,
+        #[arg(long)]
+        confirmed: bool,
+    },
+    MaintenanceStop {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        confirmed: bool,
+    },
+    Resume {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        acknowledge_data_risk: bool,
+    },
+    BackupList {
+        #[arg(long)]
+        config: PathBuf,
+    },
+    ProposeStatus {
+        #[arg(long)]
+        repository: PathBuf,
+    },
+    ProposeRetry {
+        #[arg(long)]
+        repository: PathBuf,
+        #[arg(long)]
+        base: String,
+    },
     BackupData {
         #[arg(long)]
         config: PathBuf,
@@ -119,6 +167,30 @@ enum Adopt {
 }
 #[derive(Subcommand)]
 enum Transfer {
+    List {
+        #[arg(long)]
+        config: PathBuf,
+    },
+    Cancel {
+        #[arg(long)]
+        endpoint: String,
+        #[arg(long)]
+        session: PathBuf,
+    },
+    CleanupPlan {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        id: Vec<String>,
+    },
+    CleanupApply {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        digest: String,
+        #[arg(long)]
+        reviewed: bool,
+    },
     Plan {
         #[arg(long)]
         source: PathBuf,
@@ -237,6 +309,67 @@ fn execute() -> Result<()> {
             "{}",
             gitcraft::recovery::recover(&config::load(&path)?, acknowledge_data_risk)?
         ),
+        Command::ConfigShow { config: path } => println!(
+            "{}",
+            serde_json::json!({"config":config::load(&path)?,"revision":config::revision(&path)?})
+        ),
+        Command::ConfigApply {
+            config: path,
+            input,
+            expected_revision,
+            reviewed,
+        } => {
+            anyhow::ensure!(reviewed, "Settings review required");
+            let proposed = config::validate(serde_yaml::from_str(&fs::read_to_string(input)?)?)?;
+            config::save_operational_checked(&path, proposed, &expected_revision)?;
+            println!("{{\"status\":\"completed\"}}");
+        }
+        Command::CredentialSet {
+            config: path,
+            role,
+            confirmed,
+        } => {
+            anyhow::ensure!(confirmed, "Credential confirmation required");
+            let config = config::load(&path)?;
+            let mut value = String::new();
+            std::io::Read::read_to_string(
+                &mut std::io::Read::take(std::io::stdin(), 4097),
+                &mut value,
+            )?;
+            println!(
+                "{}",
+                gitcraft::ops::set_credential(
+                    &config,
+                    &role,
+                    value.trim_end_matches(['\n', '\r']),
+                    true
+                )?
+            );
+        }
+        Command::MaintenanceStop {
+            config: path,
+            confirmed,
+        } => {
+            anyhow::ensure!(confirmed, "Maintenance stop confirmation required");
+            println!("{}", gitcraft::ops::stop(&config::load(&path)?)?);
+        }
+        Command::Resume {
+            config: path,
+            acknowledge_data_risk,
+        } => println!(
+            "{}",
+            gitcraft::ops::resume(&config::load(&path)?, acknowledge_data_risk)?
+        ),
+        Command::BackupList { config: path } => {
+            println!("{}", gitcraft::ops::backups(&config::load(&path)?)?)
+        }
+        Command::ProposeStatus { repository } => {
+            println!("{}", gitcraft::repository::proposal_status(&repository)?)
+        }
+        Command::ProposeRetry { repository, base } => println!(
+            "{}",
+            gitcraft::repository::retry_proposal(&repository, &base)?
+        ),
         Command::BackupData {
             config: path,
             include,
@@ -307,6 +440,30 @@ fn execute() -> Result<()> {
             }
         },
         Command::Transfer { command } => match command {
+            Transfer::List { config: path } => {
+                println!("{}", transfer::list_sessions(&config::load(&path)?)?)
+            }
+            Transfer::Cancel { endpoint, session } => println!(
+                "{}",
+                session_request(
+                    &endpoint,
+                    &session,
+                    "POST",
+                    "/cancel",
+                    Some(&serde_json::json!({}))
+                )?
+            ),
+            Transfer::CleanupPlan { config: path, id } => {
+                println!("{}", transfer::cleanup_plan(&config::load(&path)?, &id)?)
+            }
+            Transfer::CleanupApply {
+                config: path,
+                digest,
+                reviewed,
+            } => println!(
+                "{}",
+                transfer::cleanup_apply(&config::load(&path)?, &digest, reviewed)?
+            ),
             Transfer::Plan {
                 source,
                 kind,

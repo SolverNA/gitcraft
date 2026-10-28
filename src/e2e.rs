@@ -31,6 +31,12 @@ struct Runtime {
     snapshots: u64,
 }
 impl deploy::Runtime for Runtime {
+    fn launcher(&mut self, config: &Value) -> Result<Value> {
+        Ok(
+            json!({"Id":config["deployment"]["service"],"WorkingDirectory":config["paths"]["server"],"ExecStart":"{ path=/usr/bin/java ; argv[]=/usr/bin/java -jar server.jar nogui ; }","LaunchPath":"/usr/bin/java","LaunchArgv":["/usr/bin/java","-Xms1G","-Xmx2G","-jar","server.jar","nogui"],"LaunchFlags":[]}),
+        )
+    }
+
     fn online(&mut self) -> Result<u32> {
         Ok(self.online)
     }

@@ -138,6 +138,41 @@ fn transfer_api(mut request: Request, path: &Path, admin: &str, session_csrf: Op
         let bearer = header(&request, "Authorization")
             .and_then(|s| s.strip_prefix("Bearer ").map(str::to_owned))
             .unwrap_or_default();
+        if route.starts_with("/api/transfer-sessions") {
+            let csrf = header(&request, "X-CSRF-Token");
+            anyhow::ensure!(
+                equal(admin, &bearer)
+                    || session_csrf
+                        .zip(csrf.as_deref())
+                        .is_some_and(|(a, b)| equal(a, b)),
+                "Authentication required"
+            );
+            if route == "/api/transfer-sessions" && method == "GET" {
+                return transfer::list_sessions(&config);
+            }
+            let body = read_json(&mut request, 16384)?;
+            return match route.as_str() {
+                "/api/transfer-sessions/cleanup-plan" => {
+                    let ids = body["ids"]
+                        .as_array()
+                        .context("IDs must be an array")?
+                        .iter()
+                        .map(|id| id.as_str().map(str::to_owned).context("Invalid session ID"))
+                        .collect::<Result<Vec<_>>>()?;
+                    transfer::cleanup_plan(&config, &ids)
+                }
+                "/api/transfer-sessions/cleanup-apply" => transfer::cleanup_apply(
+                    &config,
+                    body["digest"].as_str().context("Cleanup digest missing")?,
+                    body["reviewed"] == true,
+                ),
+                "/api/transfer-sessions/cancel" => transfer::cancel_admin(
+                    &config,
+                    body["id"].as_str().context("Session ID missing")?,
+                ),
+                _ => bail!("Unknown lifecycle route"),
+            };
+        }
         if route == "/api/transfers" && method == "POST" {
             let csrf = header(&request, "X-CSRF-Token");
             anyhow::ensure!(
@@ -176,19 +211,23 @@ fn transfer_api(mut request: Request, path: &Path, admin: &str, session_csrf: Op
             let digest =
                 header(&request, "X-Chunk-SHA256").context("chunk SHA-256 header missing")?;
             // Authenticate before reading a potentially large request body.
-            transfer::status(&config, id, &bearer)?;
             anyhow::ensure!(
                 request
                     .body_length()
                     .is_some_and(|n| n <= transfer::CHUNK_BYTES),
                 "chunk exceeds byte limit"
             );
-            let mut bytes = Vec::new();
-            request
-                .as_reader()
-                .take(transfer::CHUNK_BYTES as u64 + 1)
-                .read_to_end(&mut bytes)?;
-            return transfer::chunk(&config, id, &bearer, index, offset, &digest, &bytes);
+            let length = request.body_length().context("Chunk length missing")?;
+            return transfer::receive_chunk(
+                &config,
+                id,
+                &bearer,
+                index,
+                offset,
+                &digest,
+                request.as_reader(),
+                length,
+            );
         }
         if method == "POST" && pieces.len() == 4 {
             let body = read_json(&mut request, 1024)?;
@@ -198,6 +237,7 @@ fn transfer_api(mut request: Request, path: &Path, admin: &str, session_csrf: Op
                     transfer::commit(&config, id, &bearer, body["confirm_world_replace"] == true)
                 }
                 "recover" => transfer::recover(&config, id, &bearer),
+                "cancel" => transfer::cancel(&config, id, &bearer),
                 _ => bail!("unknown transfer operation"),
             };
         }
@@ -211,7 +251,7 @@ fn transfer_api(mut request: Request, path: &Path, admin: &str, session_csrf: Op
 
 fn transfer_page(csrf: &str) -> String {
     format!(
-        "<h2>Прямой перенос local → VPS</h2><p>Данные идут прямо на этот сервер через SSH-туннель. Миры и JAR не попадают в Git или стороннее хранилище.</p><p>Браузер: максимум 64 MiB на файл, размер проверяется до чтения. Для больших файлов: <code>gitcraft transfer plan --source PATH --kind world --source-consistency stopped --output plan.json</code>, затем <code>gitcraft transfer send --endpoint http://127.0.0.1:8765 --plan plan.json --session session.json</code>. Для JAR укажите kind engine/plugin/mod.</p><input id=csrf type=hidden value='{csrf}'><label>Тип <select id=kind><option value=world>Мир (папка)</option><option value=engine>Ядро</option><option value=plugin>Плагины</option><option value=mod>Моды</option></select></label><p><input id=files type=file multiple><input id=folder type=file webkitdirectory multiple></p><label><input id=consistent type=checkbox>Локальный Minecraft остановлен или выбрана заранее сделанная согласованная snapshot-копия</label><p><select id=consistency><option value=stopped>Источник остановлен</option><option value=snapshot>Готовый snapshot</option></select></p><button id=send>Передать / продолжить</button><button id=verify>Проверить целые файлы</button><p><label><input id=confirm type=checkbox>Подтверждаю замену выбранных миров на VPS с резервной копией. Minecraft на VPS остановлен.</label></p><button id=commit>Применить проверенный перенос</button><button id=status>Статус</button><button id=recover>Восстановить прерванную замену (сервер остановлен)</button><progress id=progress max=100 value=0></progress><pre id=output>Выберите файлы/папку. При возобновлении выберите тот же источник.</pre><p>Session token хранится только в localStorage этого браузера; не передавайте его другим. После рестарта сервер сохранит смещения. Окончательное применение никогда не запускает Minecraft автоматически.</p><a href='/'>Панель</a><script src='/assets/transfer.js'></script>"
+        "<h2>Прямой перенос local → VPS</h2><p>Данные идут прямо на этот сервер через SSH-туннель. Миры и JAR не попадают в Git или стороннее хранилище.</p><p>Браузер: максимум 64 MiB на файл, размер проверяется до чтения. Для больших файлов: <code>gitcraft transfer plan --source PATH --kind world --source-consistency stopped --output plan.json</code>, затем <code>gitcraft transfer send --endpoint http://127.0.0.1:8765 --plan plan.json --session session.json</code>. Для JAR укажите kind engine/plugin/mod.</p><input id=csrf type=hidden value='{csrf}'><label>Тип <select id=kind><option value=world>Мир (папка)</option><option value=engine>Ядро</option><option value=plugin>Плагины</option><option value=mod>Моды</option></select></label><p><input id=files type=file multiple><input id=folder type=file webkitdirectory multiple></p><label><input id=consistent type=checkbox>Локальный Minecraft остановлен или выбрана заранее сделанная согласованная snapshot-копия</label><p><select id=consistency><option value=stopped>Источник остановлен</option><option value=snapshot>Готовый snapshot</option></select></p><button id=send>Передать / продолжить</button><button id=verify>Проверить целые файлы</button><p><label><input id=confirm type=checkbox>Подтверждаю замену выбранных миров на VPS с резервной копией. Minecraft на VPS остановлен.</label></p><button id=commit>Применить проверенный перенос</button><button id=status>Статус</button><button id=recover>Восстановить прерванную замену (сервер остановлен)</button><progress id=progress max=100 value=0></progress><pre id=output>Выберите файлы/папку. При возобновлении выберите тот же источник.</pre><p>Session token хранится только в localStorage этого браузера; не передавайте его другим. После рестарта сервер сохранит смещения. Окончательное применение никогда не запускает Minecraft автоматически.</p><section><button id=sessions>Сессии и занятое место</button><pre id=sessionlist></pre><input id=cleanupids placeholder='Session IDs; пусто — все допустимые'><button id=cleanupplan>Показать план очистки</button><label><input id=cleanupreviewed type=checkbox>Я проверил план очистки</label><button id=cleanupapply>Применить очистку</button><button id=cancel>Отменить текущую сессию</button></section><a href='/'>Панель</a><script src='/assets/transfer.js'></script>"
     )
 }
 fn onboarding_page(csrf: &str, current: &Value) -> String {
@@ -457,11 +497,19 @@ fn editor_save(current: &Value, form: &HashMap<String, String>) -> Result<String
 }
 
 pub fn serve(path: &Path) -> Result<()> {
+    crate::ops_ui::recover_interrupted_ui(path)?;
+    let mut listener = None;
+    loop {
+        listener = serve_instance(path, listener)?;
+    }
+}
+fn serve_instance(path: &Path, listener: Option<Server>) -> Result<Option<Server>> {
     let value = config::load(path)?;
     let env = value["web"]["token_env"]
         .as_str()
         .context("Missing token reference")?;
-    let token = std::env::var(env).context("Web token environment variable missing")?;
+    let _ = env;
+    let mut token = crate::secrets::resolve(&value, "web")?;
     anyhow::ensure!(
         token.len() >= 24,
         "Web token must contain at least 24 characters"
@@ -473,11 +521,19 @@ pub fn serve(path: &Path) -> Result<()> {
     } else {
         format!("{host}:{port}")
     };
-    let server = Server::http(&address).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let server = match listener {
+        Some(server) => server,
+        None => Server::http(&address).map_err(|e| anyhow::anyhow!(e.to_string()))?,
+    };
     let mut sessions: HashMap<String, (String, Instant)> = HashMap::new();
     let busy = Arc::new(AtomicBool::new(false));
     let settings_lock = Arc::new(Mutex::new(()));
     for mut request in server.incoming_requests() {
+        let auth = crate::secrets::resolve(&config::load(path)?, "web")?;
+        if !equal(&auth, &token) {
+            token = auth;
+            sessions.clear();
+        }
         sessions.retain(|_, (_, expiry)| *expiry > Instant::now());
         let session_id = header(&request, "Cookie").and_then(|cookie| {
             cookie.split(';').find_map(|piece| {
@@ -493,7 +549,7 @@ pub fn serve(path: &Path) -> Result<()> {
             .map(|(csrf, _)| csrf.clone());
         let method = request.method().as_str().to_owned();
         let url = request.url().to_owned();
-        if url.starts_with("/api/transfers") {
+        if url.starts_with("/api/transfers") || url.starts_with("/api/transfer-sessions") {
             transfer_api(request, path, &token, csrf.as_deref());
             continue;
         }
@@ -516,6 +572,17 @@ pub fn serve(path: &Path) -> Result<()> {
                     "Войдите через <a href='/'>панель</a>.".into(),
                     None,
                 );
+            }
+            continue;
+        }
+        if method == "GET" && url == "/operations" {
+            if let Some(csrf) = csrf {
+                match crate::ops_ui::page(path, &csrf) {
+                    Ok(html) => respond(request, 200, html, None),
+                    Err(error) => respond(request, 400, escape(&error.to_string()), None),
+                }
+            } else {
+                respond(request, 403, "Login required".into(), None);
             }
             continue;
         }
@@ -560,7 +627,7 @@ pub fn serve(path: &Path) -> Result<()> {
                     request,
                     200,
                     format!(
-                        "<p><a href=/transfer>Перенести миры и JAR напрямую</a> · <a href=/onboarding>Репозиторий / экспорт / adopt</a></p><h2>Состояние</h2><pre>{}</pre><form method=post action=/deploy>{hidden}<button>Проверить и применить, когда сервер пуст</button></form><h2>Локальные настройки</h2><p>Можно менять вручную в agent.yml. Конфиги Minecraft меняются через PR.</p><form method=post action=/settings>{hidden}<textarea name=settings>{}</textarea><button>Сохранить</button></form><form method=post action=/logout>{hidden}<button>Выйти</button></form>",
+                        "<p><a href=/operations>Полные настройки / bootstrap / backup / recovery</a> · <a href=/transfer>Перенести миры и JAR напрямую</a> · <a href=/onboarding>Репозиторий / экспорт / adopt</a></p><h2>Состояние</h2><pre>{}</pre><form method=post action=/deploy>{hidden}<button>Проверить и применить, когда сервер пуст</button></form><h2>Локальные настройки</h2><p>Можно менять вручную в agent.yml. Конфиги Minecraft меняются через PR.</p><form method=post action=/settings>{hidden}<textarea name=settings>{}</textarea><button>Сохранить</button></form><form method=post action=/logout>{hidden}<button>Выйти</button></form>",
                         escape(&serde_json::to_string_pretty(&status(&current))?),
                         escape(&serde_json::to_string_pretty(&editable)?)
                     ),
@@ -581,7 +648,7 @@ pub fn serve(path: &Path) -> Result<()> {
             respond(request, 403, "Forbidden origin".into(), None);
             continue;
         }
-        let body_limit = if url == "/editor-preview" {
+        let body_limit = if url == "/editor-preview" || url.starts_with("/operations-settings") {
             256 * 1024
         } else {
             16384
@@ -638,7 +705,119 @@ pub fn serve(path: &Path) -> Result<()> {
             respond(request, 403, "Invalid session or CSRF token".into(), None);
             continue;
         }
+        if url.starts_with("/operation/") {
+            let operation = url.trim_start_matches("/operation/").to_owned();
+            if busy.swap(true, Ordering::SeqCst) {
+                respond(request, 409, "Operation already running".into(), None);
+                continue;
+            }
+            let current = config::load(path)?;
+            if let Err(error) = crate::ops_ui::validate_operation(&operation, &form) {
+                busy.store(false, Ordering::SeqCst);
+                crate::ops_ui::record(
+                    &current,
+                    &operation,
+                    "rejected",
+                    &json!({"message":error.to_string()}),
+                )?;
+                respond(request, 400, escape(&error.to_string()), None);
+                continue;
+            }
+            crate::ops_ui::record(&current, &operation, "running", &json!({}))?;
+            let guard = busy.clone();
+            let arguments = form.clone();
+            std::thread::spawn(move || {
+                let result = crate::ops_ui::run_operation(&current, &operation, &arguments);
+                let (status, value) = crate::ops_ui::outcome(&current, result);
+                let _ = crate::ops_ui::record(&current, &operation, &status, &value);
+                guard.store(false, Ordering::SeqCst);
+            });
+            respond(
+                request,
+                202,
+                "<p>Операция запущена. Итог появится в статусе.</p><a href='/'>Панель</a>".into(),
+                None,
+            );
+            continue;
+        }
         match url.as_str() {
+            "/operations-settings-preview" => {
+                match crate::ops_ui::preview(path, csrf.as_deref().unwrap(), &form) {
+                    Ok(html) => respond(request, 200, html, None),
+                    Err(error) => respond(request, 400, escape(&error.to_string()), None),
+                }
+            }
+            "/operations-settings-apply" => {
+                let outcome = (|| -> Result<Option<Server>> {
+                    anyhow::ensure!(
+                        !busy.load(Ordering::SeqCst),
+                        "An operation is running; settings rejected"
+                    );
+                    let _guard = settings_lock
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("Settings lock unavailable"))?;
+                    let current = config::load(path)?;
+                    let _deployment = crate::deploy::lock_state(&current)?;
+                    let plan = crate::ops_ui::settings_plan(path, &form)?;
+                    let proposed = &plan["proposed"];
+                    let newserver = if current["web"]["host"] != proposed["web"]["host"]
+                        || current["web"]["port"] != proposed["web"]["port"]
+                    {
+                        let host = proposed["web"]["host"]
+                            .as_str()
+                            .context("Bind address missing")?;
+                        let port = proposed["web"]["port"]
+                            .as_u64()
+                            .context("Bind port missing")?;
+                        let address = if host.contains(':') {
+                            format!("[{host}]:{port}")
+                        } else {
+                            format!("{host}:{port}")
+                        };
+                        Some(Server::http(&address).map_err(|_| {
+                            anyhow::anyhow!("New Web address cannot be bound; settings unchanged")
+                        })?)
+                    } else {
+                        None
+                    };
+                    config::save_checked(
+                        path,
+                        proposed.clone(),
+                        plan["revision"].as_str().context("Revision missing")?,
+                    )?;
+                    Ok(newserver)
+                })();
+                match outcome {
+                    Ok(next) => {
+                        respond(request,200,"<p>Настройки сохранены. Если изменён Web адрес/token — переподключитесь и войдите заново.</p><a href='/operations'>Операции</a>".into(),None);
+                        if let Some(next) = next {
+                            return Ok(Some(next));
+                        }
+                    }
+                    Err(error) => respond(request, 400, escape(&error.to_string()), None),
+                }
+            }
+            "/credential-save" => {
+                let outcome = (|| -> Result<Value> {
+                    anyhow::ensure!(!busy.load(Ordering::SeqCst), "An operation is running");
+                    anyhow::ensure!(
+                        form.get("confirmed").is_some_and(|v| v == "yes"),
+                        "Credential confirmation required"
+                    );
+                    let current = config::load(path)?;
+                    let _lock = crate::deploy::lock_state(&current)?;
+                    let role = form.get("role").context("Credential role missing")?;
+                    if role == "rcon" {
+                        crate::deploy::ensure_stopped(&current)?;
+                    }
+                    crate::secrets::write(
+                        &current,
+                        role,
+                        form.get("secret").context("Credential missing")?,
+                    )
+                })();
+                match outcome{Ok(value)=>respond(request,200,format!("<pre>{}</pre><a href='/'>Login / панель</a>",escape(&value.to_string())),None),Err(_)=>respond(request,400,"Credential update rejected. Check confirmation, stopped service and private provider permissions; values omitted.".into(),None)}
+            }
             "/editor-open" | "/editor-preview" | "/editor-save" => {
                 let result = (|| -> Result<String> {
                     let current = config::load(path)?;
@@ -681,7 +860,7 @@ pub fn serve(path: &Path) -> Result<()> {
                             proposed["repository"]["branch"] =
                                 json!(form.get("branch").context("branch missing")?);
                             let proposed = config::validate(proposed)?;
-                            let plan = json!({"previous":current,"proposed":proposed});
+                            let plan = json!({"previous":current,"proposed":proposed,"revision":config::revision(path)?});
                             let digest = write_ui_plan(
                                 &ui_plan_path(&current, "ui-onboarding.json")?,
                                 &plan,
@@ -695,7 +874,15 @@ pub fn serve(path: &Path) -> Result<()> {
                                 plan["previous"] == current,
                                 "configuration changed; create a fresh plan"
                             );
-                            config::save(path, plan["proposed"].clone())?;
+                            anyhow::ensure!(
+                                !busy.load(Ordering::SeqCst),
+                                "An operation is running"
+                            );
+                            config::save_operational_checked(
+                                path,
+                                plan["proposed"].clone(),
+                                plan["revision"].as_str().context("Revision missing")?,
+                            )?;
                             fs::remove_file(p)?;
                             Ok("<p>Подключение сохранено. Следующая проверка агента перечитает конфигурацию.</p><a href='/'>Панель</a>".into())
                         }
@@ -807,7 +994,7 @@ pub fn serve(path: &Path) -> Result<()> {
                         let result = crate::repository::authoring_repository(&current)
                             .and_then(|repo| crate::repository::propose(&repo, base, &title));
                         let value = match result {
-                            Ok(result) => json!({"status":"complete","result":result}),
+                            Ok(result) => json!({"status":"completed","result":result}),
                             Err(error) => json!({"status":"error","error":error.to_string()}),
                         };
                         write_ui_plan(&target, &value)?;
@@ -842,7 +1029,9 @@ pub fn serve(path: &Path) -> Result<()> {
                 let path = PathBuf::from(path);
                 std::thread::spawn(move || {
                     if let Ok(value) = config::load(&path) {
-                        let _ = deploy::run(&value);
+                        let _ = crate::ops_ui::record(&value, "deploy", "running", &json!({}));
+                        let (status, result) = crate::ops_ui::outcome(&value, deploy::run(&value));
+                        let _ = crate::ops_ui::record(&value, "deploy", &status, &result);
                     }
                     busy.store(false, Ordering::SeqCst);
                 });
@@ -874,7 +1063,8 @@ pub fn serve(path: &Path) -> Result<()> {
                     for key in ["empty_grace_seconds", "health_timeout_seconds"] {
                         value["deployment"][key] = edit[key].clone();
                     }
-                    config::save(path, value)?;
+                    let revision = config::revision(path)?;
+                    config::save_operational_checked(path, value, &revision)?;
                     Ok(())
                 })();
                 respond(
@@ -892,7 +1082,7 @@ pub fn serve(path: &Path) -> Result<()> {
             _ => respond(request, 404, "Not found".into(), None),
         }
     }
-    Ok(())
+    Ok(None)
 }
 #[cfg(test)]
 mod tests {

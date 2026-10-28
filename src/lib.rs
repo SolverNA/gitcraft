@@ -19,3 +19,9 @@ pub mod repository;
 
 #[cfg(test)]
 mod e2e;
+
+pub mod secrets;
+
+pub mod ops;
+
+pub mod ops_ui;

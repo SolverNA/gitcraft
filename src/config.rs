@@ -9,7 +9,25 @@ use std::{
 pub fn load(path: &Path) -> Result<Value> {
     let value: Value =
         serde_yaml::from_str(&fs::read_to_string(path).context("Read agent configuration")?)?;
+    let mut value = validate(value)?;
+    bind_store(path, &mut value)?;
     validate(value)
+}
+fn bind_store(path: &Path, value: &mut Value) -> Result<()> {
+    let expected = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+        .canonicalize()?
+        .join("local-secrets.json");
+    let configured = value["secrets"]["store_path"]
+        .as_str()
+        .context("Credential store reference invalid")?;
+    if !configured.is_empty() && Path::new(configured) != expected {
+        bail!("Local credential provider must remain adjacent to agent.yml as local-secrets.json");
+    }
+    value["secrets"]["store_path"] = json!(expected);
+    Ok(())
 }
 
 pub fn validate(mut value: Value) -> Result<Value> {
@@ -18,6 +36,7 @@ pub fn validate(mut value: Value) -> Result<Value> {
         "deployment":{"service":"minecraft.service","empty_grace_seconds":60,"health_timeout_seconds":120},
         "rcon":{"host":"127.0.0.1","port":25575,"password_env":"MINECRAFT_RCON_PASSWORD","timeout_seconds":5},
         "web":{"host":"127.0.0.1","port":8765,"token_env":"GITCRAFT_WEB_TOKEN"},
+        "secrets":{"store_path":""},
         "transfer":{"max_session_bytes":107374182400u64,"max_staging_bytes":214748364800u64,"max_files":100000,"min_free_bytes":1073741824,"session_ttl_seconds":604800}
     });
     let object = value
@@ -31,6 +50,7 @@ pub fn validate(mut value: Value) -> Result<Value> {
             "web",
             "paths",
             "transfer",
+            "secrets",
         ]
         .contains(&key.as_str())
         {
@@ -160,6 +180,34 @@ pub fn validate(mut value: Value) -> Result<Value> {
             }
         }
     }
+    let store = value["secrets"]["store_path"]
+        .as_str()
+        .context("secrets.store_path must be a string")?;
+    if !store.is_empty() {
+        let path = Path::new(store);
+        if !path.is_absolute()
+            || path == Path::new("/")
+            || path
+                .components()
+                .any(|part| matches!(part, std::path::Component::ParentDir))
+        {
+            bail!("Credential store must be an absolute private file");
+        }
+        if resolved
+            .iter()
+            .any(|other| path.starts_with(other) || other.starts_with(path))
+            || (!authoring.is_empty() && path.starts_with(authoring))
+        {
+            bail!("Credential store must be separate from managed paths and authoring clone");
+        }
+        let mut prefix = PathBuf::new();
+        for part in path.components() {
+            prefix.push(part);
+            if prefix.is_symlink() {
+                bail!("Credential store must not contain symlinks");
+            }
+        }
+    }
     for (section, key, min, max) in [
         ("repository", "poll_interval_seconds", 1, 86400),
         ("deployment", "empty_grace_seconds", 0, 86400),
@@ -222,6 +270,8 @@ pub fn validate(mut value: Value) -> Result<Value> {
 }
 
 pub fn save(path: &Path, value: Value) -> Result<Value> {
+    let mut value = validate(value)?;
+    bind_store(path, &mut value)?;
     let value = validate(value)?;
     let mut temporary =
         tempfile::NamedTempFile::new_in(path.parent().context("Config parent missing")?)?;
@@ -230,7 +280,134 @@ pub fn save(path: &Path, value: Value) -> Result<Value> {
     temporary
         .persist(path)
         .map_err(|e| anyhow::anyhow!(e.error))?;
+    fs::File::open(path.parent().context("Config parent missing")?)?.sync_all()?;
     Ok(value)
+}
+
+pub fn revision(path: &Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    Ok(hex::encode(Sha256::digest(fs::read(path)?)))
+}
+pub fn save_checked(path: &Path, value: Value, expected: &str) -> Result<Value> {
+    use fs2::FileExt;
+    crate::deploy::safe_path(
+        path.parent().context("Config parent missing")?,
+        path.file_name()
+            .and_then(|s| s.to_str())
+            .context("Config name invalid")?,
+    )?;
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(crate::deploy::safe_path(
+            path.parent().unwrap(),
+            ".config.lock",
+        )?)?;
+    lock.try_lock_exclusive()
+        .context("Configuration update already running")?;
+    if revision(path)? != expected {
+        bail!("Configuration changed; preview again before applying");
+    }
+    let result = save(path, value);
+    FileExt::unlock(&lock)?;
+    result
+}
+
+fn has_operational_data(path: &Path, metadata: bool) -> Result<bool> {
+    for entry in fs::read_dir(path)? {
+        let path = entry?.path();
+        let name = path.file_name().unwrap().to_string_lossy();
+        if metadata
+            && path.is_file()
+            && !path.is_symlink()
+            && [
+                "deploy.lock",
+                "ui-settings-full.json",
+                "ui-operation.json",
+                "ui-onboarding.json",
+                "ui-edit.json",
+                "ui-export.json",
+                "ui-adopt.json",
+            ]
+            .contains(&name.as_ref())
+        {
+            continue;
+        }
+        if path.is_symlink() {
+            return Ok(true);
+        }
+        if path.is_file() || path.is_dir() && has_operational_data(&path, false)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+pub fn operational_change(current: &Value, proposed: &Value) -> Result<()> {
+    if current["paths"] != proposed["paths"]
+        || current["deployment"]["service"] != proposed["deployment"]["service"]
+        || current["rcon"] != proposed["rcon"]
+    {
+        crate::deploy::ensure_stopped(current)?;
+    }
+    if current["repository"] != proposed["repository"]
+        && let Ok(repo) = crate::repository::authoring_repository(current)
+    {
+        let pending = crate::repository::proposal_status(&repo)?;
+        if ["local_verified", "pushed", "pr_pending", "retry_blocked"]
+            .contains(&pending["status"].as_str().unwrap_or(""))
+        {
+            bail!(
+                "A proposal is pending; finish or retry it before changing repository connection settings"
+            );
+        }
+    }
+    for key in [
+        "repository",
+        "server",
+        "state",
+        "cache",
+        "staging",
+        "backups",
+    ] {
+        if current["paths"][key] != proposed["paths"][key] {
+            let old = Path::new(current["paths"][key].as_str().context("Old path missing")?);
+            if old.is_dir() && has_operational_data(old, key == "state")? {
+                bail!("Managed path contains state or data; automatic migration is forbidden");
+            }
+        }
+    }
+    let state = Path::new(
+        current["paths"]["state"]
+            .as_str()
+            .context("State missing")?,
+    );
+    if current["deployment"]["service"] != proposed["deployment"]["service"]
+        && state.join("deployment.json").exists()
+    {
+        bail!(
+            "Existing ownership belongs to the current service; use a separate reviewed adoption instead of renaming it"
+        );
+    }
+    if current["secrets"]["store_path"] != proposed["secrets"]["store_path"]
+        && current["secrets"]["store_path"]
+            .as_str()
+            .is_some_and(|p| !p.is_empty() && Path::new(p).exists())
+    {
+        bail!("Credential store cannot be moved by changing settings");
+    }
+    if crate::recovery::pending(current)?.is_some() || crate::transfer::has_pending(current)? {
+        bail!("Recovery is pending; settings cannot orphan the existing transaction");
+    }
+    Ok(())
+}
+
+pub fn save_operational_checked(path: &Path, value: Value, expected: &str) -> Result<Value> {
+    let current = load(path)?;
+    let _guard = crate::deploy::lock_state(&current)?;
+    let proposed = validate(value)?;
+    operational_change(&current, &proposed)?;
+    save_checked(path, proposed, expected)
 }
 
 #[cfg(test)]
@@ -294,5 +471,42 @@ mod tests {
         value["repository"]["authoring_path"] = json!(authoring);
         value["paths"]["server"] = json!(alias);
         assert!(validate(value).is_err());
+    }
+    #[test]
+    fn optimistic_save_and_dedicated_store_do_not_overwrite_newer_config() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("agent.yml");
+        save(&path, sample()).unwrap();
+        let revision = revision(&path).unwrap();
+        let mut current = load(&path).unwrap();
+        current["repository"]["poll_interval_seconds"] = json!(42);
+        save_checked(&path, current.clone(), &revision).unwrap();
+        assert!(save_checked(&path, current.clone(), &revision).is_err());
+        let bytes = fs::read(&path).unwrap();
+        current["secrets"]["store_path"] = json!(root.path().join("other.json"));
+        assert!(save(&path, current).is_err());
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+    }
+    #[test]
+    fn pending_recovery_blocks_even_non_path_settings() {
+        let root = tempfile::tempdir().unwrap();
+        let mut value = sample();
+        for key in [
+            "repository",
+            "server",
+            "state",
+            "cache",
+            "staging",
+            "backups",
+        ] {
+            value["paths"][key] = json!(root.path().join(key));
+        }
+        let value = validate(value).unwrap();
+        let state = Path::new(value["paths"]["state"].as_str().unwrap());
+        fs::create_dir_all(state).unwrap();
+        fs::write(state.join("transaction.json"), "{}").unwrap();
+        let mut proposed = value.clone();
+        proposed["repository"]["poll_interval_seconds"] = json!(33);
+        assert!(operational_change(&value, &proposed).is_err());
     }
 }
