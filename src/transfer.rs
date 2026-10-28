@@ -948,6 +948,16 @@ fn session_entries(base: &Path) -> Result<Vec<PathBuf>> {
     entries.sort();
     Ok(entries)
 }
+fn unavailable_summary(dir: &Path) -> Result<Value> {
+    let id = dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .context("invalid session directory")?;
+    let staged = staged_bytes(&dir.join("data"))?;
+    Ok(
+        json!({"id":id,"status":"unavailable","created":null,"expires":null,"expired":null,"staged_bytes":staged,"reserved_bytes":staged,"disk_bytes":staged_bytes(dir)?,"eligible_cleanup":false,"protected_reason":"session metadata missing or malformed; inspect manually, never auto-delete"}),
+    )
+}
 pub fn list_sessions(config: &Value) -> Result<Value> {
     let base = root(config)?;
     let _global = lock(&base.join("create.lock"))?;
@@ -955,8 +965,10 @@ pub fn list_sessions(config: &Value) -> Result<Value> {
     let (mut staged, mut reserved) = (0u64, 0u64);
     for dir in session_entries(&base)? {
         let guard = lock(&crate::deploy::safe_path(&dir, "session.lock")?);
-        let s = raw_session(&dir)?;
-        let value = session_summary(config, &dir, &s, guard.is_err())?;
+        let value = match raw_session(&dir) {
+            Ok(s) => session_summary(config, &dir, &s, guard.is_err())?,
+            Err(_) => unavailable_summary(&dir)?,
+        };
         staged = staged
             .checked_add(
                 value["staged_bytes"]
@@ -1076,7 +1088,13 @@ pub fn cleanup_plan(config: &Value, ids: &[String]) -> Result<Value> {
         }
         seen.insert(id.to_owned());
         let guard = lock(&crate::deploy::safe_path(&dir, "session.lock")?);
-        let s = raw_session(&dir)?;
+        let s = match raw_session(&dir) {
+            Ok(s) => s,
+            Err(_) => {
+                protected.push(unavailable_summary(&dir)?);
+                continue;
+            }
+        };
         let summary = session_summary(config, &dir, &s, guard.is_err())?;
         if summary["eligible_cleanup"] == true {
             let size = summary["disk_bytes"]
@@ -1455,6 +1473,11 @@ mod tests {
                 .is_some_and(|a| !a.is_empty())
         );
         assert!(!receipt.to_string().contains(token));
+        fs::create_dir_all(dir.path().join("requirements")).unwrap();
+        fs::write(dir.path().join("requirements/plugins.json"),json!({"plugins":[{"name":"Local","filename":"Local.jar","pinned":{"transfer":true,"version":"fixture","sha256":hash(b"jar")},"source":{"provider":"transfer"}}]}).to_string()).unwrap();
+        let pins = crate::artifacts::load_manifest(dir.path()).unwrap();
+        let verified = crate::artifacts::download(&pins[0], &dir.path().join("cache")).unwrap();
+        assert_eq!(fs::read(verified).unwrap(), b"jar");
     }
     #[test]
     fn cleanup_resumes_after_partial_tombstone_removal_and_is_idempotent() {
@@ -1523,5 +1546,29 @@ mod tests {
         assert!(receive_chunk(&c, id, token, 0, 0, &hash(b"abc"), &mut reader, 3).is_err());
         let plan = cleanup_plan(&c, &[]).unwrap();
         assert_eq!(plan["plan"]["candidates"].as_array().unwrap().len(), 1);
+    }
+    #[test]
+    fn orphan_metadata_stays_protected_without_blocking_healthy_session_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = config(dir.path());
+        let s = create(&c, manifest(b"known")).unwrap();
+        cancel_admin(&c, s["id"].as_str().unwrap()).unwrap();
+        let orphan = root(&c).unwrap().join("a".repeat(64));
+        fs::create_dir_all(orphan.join("data")).unwrap();
+        fs::write(orphan.join("data/0"), b"orphan").unwrap();
+        let listing = list_sessions(&c).unwrap();
+        assert_eq!(listing["sessions"].as_array().unwrap().len(), 2);
+        assert!(
+            listing["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|s| s["status"] == "unavailable" && s["eligible_cleanup"] == false)
+        );
+        let plan = cleanup_plan(&c, &[]).unwrap();
+        assert_eq!(plan["plan"]["candidates"].as_array().unwrap().len(), 1);
+        assert_eq!(plan["plan"]["protected"].as_array().unwrap().len(), 1);
+        cleanup_apply(&c, plan["digest"].as_str().unwrap(), true).unwrap();
+        assert!(orphan.join("data/0").exists());
     }
 }
