@@ -312,10 +312,10 @@ pub(crate) fn initialize_with(
             json!({"status":"activation_required","unit":UNIT,"message":error.to_string(),"observed":status_with(runtime),"retry_without_reinitializing":true})
         }
     };
-    if let Some(state) = config["paths"]["state"].as_str() {
-        if crate::recovery::durable_json(&Path::new(state).join("status.json"), &result).is_err() {
-            result["status_recorded"] = json!(false);
-        }
+    if let Some(state) = config["paths"]["state"].as_str()
+        && crate::recovery::durable_json(&Path::new(state).join("status.json"), &result).is_err()
+    {
+        result["status_recorded"] = json!(false);
     }
     Ok(result)
 }
