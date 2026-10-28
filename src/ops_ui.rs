@@ -28,10 +28,12 @@ fn plan_path(config: &Value) -> Result<PathBuf> {
 pub fn page(path: &Path, csrf: &str) -> Result<String> {
     let config = crate::config::load(path)?;
     let h = hidden(csrf);
+    let poller = crate::agent_service::status();
     let mut html = format!(
         "<h2>Операции и полные настройки</h2><p>Значения проверяются до сохранения. Изменение путей не переносит миры, state, кеш или резервные копии. Нельзя менять unit через произвольную shell-команду.</p><form method=post action=/operations-settings-preview>{h}<input type=hidden name=revision value='{}'>",
         revision(path)?
     );
+    html.push_str(&poller_panel(&poller, csrf));
     for (section, fields) in config.as_object().context("Config invalid")? {
         html.push_str(&format!("<fieldset><legend>{}</legend>", escape(section)));
         for (key, value) in fields.as_object().context("Section invalid")? {
@@ -61,6 +63,11 @@ pub fn page(path: &Path, csrf: &str) -> Result<String> {
     html.push_str("<button>Проверить настройки и показать план</button></form>");
     html.push_str(&format!("<h3>Локальные credentials — только запись</h3><pre>{}</pre><p>Пароли не возвращаются в страницу, preview, JSON или журнал. RCON можно менять только при остановленном Minecraft. Web token сменит login и завершит действующие сессии.</p><form method=post action=/credential-save>{h}<select name=role><option value=rcon>RCON password</option><option value=web>Web login token</option></select><input type=password name=secret autocomplete=new-password required><label><input type=checkbox name=confirmed value=yes required>Подтверждаю смену локального credential</label><button>Записать секрет</button></form>",escape(&crate::secrets::status(&config).to_string())));
     for (action, title, extra) in [
+        (
+            "agent-activate",
+            "Подтвердить и включить автоматическую проверку Git",
+            "<p>Только проверенный установленный gitcraft-agent.service. При отказе автоматизация не считается включённой; initialization повторять не нужно.</p>",
+        ),
         (
             "bootstrap",
             "Первый запуск — EULA",
@@ -172,6 +179,12 @@ pub fn run_operation(config: &Value, name: &str, form: &HashMap<String, String>)
         "Explicit operation confirmation required"
     );
     match name {
+        "agent-activate" => Ok(match crate::agent_service::activate(config) {
+            Ok(value) => value,
+            Err(error) => {
+                json!({"status":"activation_required","message":error.to_string(),"observed":crate::agent_service::status(),"next_action":"agent-activate"})
+            }
+        }),
         "bootstrap" => {
             ensure!(
                 form.get("accept_eula").is_some_and(|v| v == "yes"),
@@ -217,6 +230,7 @@ pub fn validate_operation(name: &str, form: &HashMap<String, String>) -> Result<
     ensure!(
         [
             "bootstrap",
+            "agent-activate",
             "stop",
             "resume",
             "recover",
@@ -260,6 +274,11 @@ pub fn outcome(config: &Value, result: Result<Value>) -> (String, Value) {
                 .contains(&value["status"].as_str().unwrap_or(""))
             {
                 "rejected"
+            } else if ["partial_success", "activation_required"]
+                .contains(&value["status"].as_str().unwrap_or(""))
+                || value["agent_activation"]["status"] == "activation_required"
+            {
+                "activation_required"
             } else if value["status"] == "recovery_required" {
                 "recovery_required"
             } else {
@@ -321,4 +340,50 @@ pub fn recover_interrupted_ui(path: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn poller_panel(status: &Value, _csrf: &str) -> String {
+    format!(
+        "<section id=poller-status><h3>Автоматическая проверка Git</h3><p>Фактическое состояние установленного фонового сервиса: active и enabled проверяются отдельно. Unknown означает, что состояние не подтверждено. Успешный старт Minecraft сам по себе не означает включение автообновлений.</p><pre>{}</pre><p>При activation_required проверьте причину ниже и используйте подтверждённое включение агента. Не повторяйте bootstrap/adopt только ради запуска poller.</p></section>",
+        escape(&serde_json::to_string_pretty(status).unwrap_or_else(|_| "unknown".into()))
+    )
+}
+
+#[cfg(test)]
+mod activation_ui_tests {
+    use super::*;
+
+    #[test]
+    fn initialized_without_enabled_poller_is_not_completed() {
+        let result = json!({"status":"partial_success","initialized":true,"initialization_status":"adopted","agent_activation":{"status":"activation_required","observed":{"active":"inactive","enabled":"disabled"}}});
+        let (status, details) = outcome(&json!({}), Ok(result.clone()));
+        assert_eq!(status, "activation_required");
+        assert_eq!(details, result);
+        let (status, _) = outcome(
+            &json!({}),
+            Ok(
+                json!({"status":"deployed","agent_activation":{"status":"activated","active":"active","enabled":"enabled"}}),
+            ),
+        );
+        assert_eq!(status, "completed");
+    }
+
+    #[test]
+    fn poller_retry_requires_confirmation_and_unknown_is_not_false() {
+        assert!(validate_operation("agent-activate", &HashMap::new()).is_err());
+        assert!(
+            validate_operation(
+                "agent-activate",
+                &HashMap::from([("confirmed".into(), "yes".into())])
+            )
+            .is_ok()
+        );
+        let html = poller_panel(
+            &json!({"active":"unknown","enabled":"unknown","message":"<script>"}),
+            "csrf",
+        );
+        assert!(html.contains("unknown"));
+        assert!(!html.contains("<script>"));
+        assert!(html.contains("&lt;script&gt;"));
+    }
 }

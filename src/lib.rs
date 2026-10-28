@@ -25,3 +25,10 @@ pub mod secrets;
 pub mod ops;
 
 pub mod ops_ui;
+
+pub mod agent_loop;
+
+pub mod agent_service;
+
+#[cfg(test)]
+mod activation_acceptance;

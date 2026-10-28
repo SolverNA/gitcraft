@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use gitcraft::{config, deploy, transfer, updater, web};
-use std::{fs, io::Write, path::PathBuf, thread, time::Duration};
+use std::{fs, io::Write, path::PathBuf};
 #[derive(Parser)]
 #[command(version, about = "Minecraft GitOps manager")]
 struct Cli {
@@ -101,6 +101,10 @@ enum Command {
         config: PathBuf,
         #[arg(long)]
         acknowledge_data_risk: bool,
+    },
+    AgentActivate {
+        #[arg(long)]
+        config: PathBuf,
     },
     BackupList {
         #[arg(long)]
@@ -272,26 +276,7 @@ fn execute() -> Result<()> {
         Command::Validate { repository } => {
             println!("{}", gitcraft::policy::validate_repository(&repository)?);
         }
-        Command::Agent { config: path, once } => loop {
-            let value = config::load(&path)?;
-            match deploy::run(&value) {
-                Ok(result) => println!("{result}"),
-                Err(error) => {
-                    eprintln!("Deployment failed: {error}");
-                    if once {
-                        return Err(error);
-                    }
-                }
-            }
-            if once {
-                break;
-            }
-            thread::sleep(Duration::from_secs(
-                value["repository"]["poll_interval_seconds"]
-                    .as_u64()
-                    .unwrap_or(60),
-            ));
-        },
+        Command::Agent { config: path, once } => gitcraft::agent_loop::run(&path, once)?,
         Command::Deploy { config: path } => println!("{}", deploy::run(&config::load(&path)?)?),
         Command::Bootstrap {
             config: path,
@@ -359,6 +344,10 @@ fn execute() -> Result<()> {
         } => println!(
             "{}",
             gitcraft::ops::resume(&config::load(&path)?, acknowledge_data_risk)?
+        ),
+        Command::AgentActivate { config: path } => println!(
+            "{}",
+            gitcraft::agent_service::activate(&config::load(&path)?)?
         ),
         Command::BackupList { config: path } => {
             println!("{}", gitcraft::ops::backups(&config::load(&path)?)?)

@@ -18,7 +18,8 @@ use std::{
 use tiny_http::{Header, Request, Response, Server};
 
 pub fn status(value: &Value) -> Value {
-    let mut result = json!({"service":value["deployment"]["service"]});
+    let mut result =
+        json!({"service":value["deployment"]["service"],"poller":crate::agent_service::status()});
     if let Some(state) = value["paths"]["state"].as_str() {
         for name in ["status", "deployment", "ui-operation"] {
             if let Ok(text) = fs::read_to_string(Path::new(state).join(format!("{name}.json")))
@@ -496,14 +497,88 @@ fn editor_save(current: &Value, form: &HashMap<String, String>) -> Result<String
     Ok("<p>Сохранено только в отдельном рабочем клоне. Проверьте diff и создайте PR.</p><a href='/editor'>Проверить изменения</a> · <a href='/onboarding'>Создать PR</a>".into())
 }
 
+#[cfg(test)]
+pub(crate) type OperationRunner =
+    dyn Fn(&Value, &str, &HashMap<String, String>) -> Result<Value> + Send + Sync;
+#[derive(Clone, Default)]
+struct RuntimeHooks {
+    #[cfg(test)]
+    runner: Option<Arc<OperationRunner>>,
+    #[cfg(test)]
+    stopped: Option<Arc<AtomicBool>>,
+}
+impl RuntimeHooks {
+    fn operation(
+        &self,
+        config: &Value,
+        name: &str,
+        form: &HashMap<String, String>,
+    ) -> Result<Value> {
+        #[cfg(test)]
+        if let Some(runner) = &self.runner {
+            return runner(config, name, form);
+        }
+        crate::ops_ui::run_operation(config, name, form)
+    }
+    fn adopt_plan(&self, config: &Value, server: &Path) -> Result<Value> {
+        #[cfg(test)]
+        if let Some(runner) = &self.runner {
+            return runner(
+                config,
+                "adopt-plan",
+                &HashMap::from([("server".into(), server.to_string_lossy().into_owned())]),
+            );
+        }
+        crate::adopt::plan(config, server)
+    }
+    fn adopt(&self, config: &Value, plan: &Value, repo: &Path, expected: &str) -> Result<Value> {
+        #[cfg(test)]
+        if let Some(runner) = &self.runner {
+            let form = HashMap::from([
+                ("plan".into(), serde_json::to_string(plan)?),
+                ("repository".into(), repo.to_string_lossy().into_owned()),
+                ("expected_commit".into(), expected.into()),
+            ]);
+            return runner(config, "adopt", &form);
+        }
+        crate::adopt::apply(config, plan, repo, expected)
+    }
+    fn stopped(&self) -> bool {
+        #[cfg(test)]
+        if let Some(stopped) = &self.stopped {
+            return stopped.load(Ordering::SeqCst);
+        }
+        false
+    }
+}
+#[cfg(test)]
+pub(crate) fn serve_fixture(
+    path: &Path,
+    runner: Arc<OperationRunner>,
+    stopped: Arc<AtomicBool>,
+) -> Result<()> {
+    let mut listener = None;
+    let hooks = RuntimeHooks {
+        runner: Some(runner),
+        stopped: Some(stopped),
+    };
+    while !hooks.stopped() {
+        listener = serve_instance(path, listener, hooks.clone())?;
+    }
+    Ok(())
+}
 pub fn serve(path: &Path) -> Result<()> {
     crate::ops_ui::recover_interrupted_ui(path)?;
     let mut listener = None;
     loop {
-        listener = serve_instance(path, listener)?;
+        listener = serve_instance(path, listener, RuntimeHooks::default())?;
     }
 }
-fn serve_instance(path: &Path, listener: Option<Server>) -> Result<Option<Server>> {
+fn serve_instance(
+    path: &Path,
+    listener: Option<Server>,
+    hooks: RuntimeHooks,
+) -> Result<Option<Server>> {
     let value = config::load(path)?;
     let env = value["web"]["token_env"]
         .as_str()
@@ -529,6 +604,10 @@ fn serve_instance(path: &Path, listener: Option<Server>) -> Result<Option<Server
     let busy = Arc::new(AtomicBool::new(false));
     let settings_lock = Arc::new(Mutex::new(()));
     for mut request in server.incoming_requests() {
+        if hooks.stopped() {
+            respond(request, 503, "Fixture stopped".into(), None);
+            return Ok(None);
+        }
         let auth = crate::secrets::resolve(&config::load(path)?, "web")?;
         if !equal(&auth, &token) {
             token = auth;
@@ -726,8 +805,9 @@ fn serve_instance(path: &Path, listener: Option<Server>) -> Result<Option<Server
             crate::ops_ui::record(&current, &operation, "running", &json!({}))?;
             let guard = busy.clone();
             let arguments = form.clone();
+            let hooks = hooks.clone();
             std::thread::spawn(move || {
-                let result = crate::ops_ui::run_operation(&current, &operation, &arguments);
+                let result = hooks.operation(&current, &operation, &arguments);
                 let (status, value) = crate::ops_ui::outcome(&current, result);
                 let _ = crate::ops_ui::record(&current, &operation, &status, &value);
                 guard.store(false, Ordering::SeqCst);
@@ -928,7 +1008,7 @@ fn serve_instance(path: &Path, listener: Option<Server>) -> Result<Option<Server
                         "/adopt-plan" => {
                             let server =
                                 PathBuf::from(form.get("server").context("server missing")?);
-                            let plan = crate::adopt::plan(&current, &server)?;
+                            let plan = hooks.adopt_plan(&current, &server)?;
                             let digest =
                                 write_ui_plan(&ui_plan_path(&current, "ui-adopt.json")?, &plan)?;
                             review_html(
@@ -948,9 +1028,12 @@ fn serve_instance(path: &Path, listener: Option<Server>) -> Result<Option<Server
                             let expected = form
                                 .get("expected_commit")
                                 .context("approved commit missing")?;
-                            let result = crate::adopt::apply(&current, &plan, &repo, expected)?;
+                            let result = hooks.adopt(&current, &plan, &repo, expected)?;
+                            let (operation_status, details) =
+                                crate::ops_ui::outcome(&current, Ok(result.clone()));
+                            crate::ops_ui::record(&current, "adopt", &operation_status, &details)?;
                             Ok(format!(
-                                "<pre>{}</pre><a href='/'>Панель</a>",
+                                "<pre>{}</pre><a href='/operations'>Проверить автоматизацию / повторить включение агента</a> · <a href='/'>Панель</a>",
                                 escape(&result.to_string())
                             ))
                         }
