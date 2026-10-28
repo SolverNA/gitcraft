@@ -344,6 +344,7 @@ fn has_operational_data(path: &Path, metadata: bool) -> Result<bool> {
     Ok(false)
 }
 pub fn operational_change(current: &Value, proposed: &Value) -> Result<()> {
+    crate::minecraft_autostart::guard_configuration_change(current, proposed)?;
     let path_change = current["paths"] != proposed["paths"];
     let connection_change = ["url", "branch", "authoring_path"]
         .iter()
@@ -536,6 +537,36 @@ mod tests {
         proposed["transfer"]["max_files"] = json!(2000);
         assert!(operational_change(&value, &proposed).is_ok());
     }
+    #[test]
+    fn persistent_maintenance_cannot_be_orphaned_by_settings() {
+        let root = tempfile::tempdir().unwrap();
+        let mut value = sample();
+        for key in [
+            "repository",
+            "server",
+            "state",
+            "cache",
+            "staging",
+            "backups",
+        ] {
+            value["paths"][key] = json!(root.path().join(key));
+        }
+        let value = validate(value).unwrap();
+        let state = Path::new(value["paths"]["state"].as_str().unwrap());
+        fs::create_dir_all(state).unwrap();
+        fs::write(state.join("maintenance.json"), "{}").unwrap();
+        let mut proposed = value.clone();
+        proposed["paths"]["server"] = json!(root.path().join("replacement"));
+        assert!(operational_change(&value, &proposed).is_err());
+        let mut proposed = value.clone();
+        proposed["deployment"]["service"] = json!("replacement.service");
+        assert!(operational_change(&value, &proposed).is_err());
+        let mut proposed = value.clone();
+        proposed["web"]["port"] = json!(8766);
+        proposed["transfer"]["max_files"] = json!(2000);
+        assert!(operational_change(&value, &proposed).is_ok());
+    }
+
     #[test]
     fn receiving_session_rejects_destination_changes_but_not_limits() {
         let root = tempfile::tempdir().unwrap();

@@ -102,6 +102,14 @@ enum Command {
         #[arg(long)]
         acknowledge_data_risk: bool,
     },
+    MinecraftAutostart {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long, value_parser = ["enabled", "disabled"])]
+        policy: String,
+        #[arg(long)]
+        confirmed: bool,
+    },
     AgentActivate {
         #[arg(long)]
         config: PathBuf,
@@ -344,6 +352,14 @@ fn execute() -> Result<()> {
         } => println!(
             "{}",
             gitcraft::ops::resume(&config::load(&path)?, acknowledge_data_risk)?
+        ),
+        Command::MinecraftAutostart {
+            config: path,
+            policy,
+            confirmed,
+        } => println!(
+            "{}",
+            gitcraft::minecraft_autostart::set(&config::load(&path)?, &policy, confirmed)?
         ),
         Command::AgentActivate { config: path } => println!(
             "{}",

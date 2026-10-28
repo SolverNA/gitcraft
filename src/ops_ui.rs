@@ -34,6 +34,7 @@ pub fn page(path: &Path, csrf: &str) -> Result<String> {
         revision(path)?
     );
     html.push_str(&poller_panel(&poller, csrf));
+    html.push_str(&format!("<section id=minecraft-autostart><h3>Minecraft после перезагрузки машины</h3><pre>{}</pre><p>Это отдельная политика от фонового Git-агента. Выберите её явно после bootstrap/adopt. desired_boot_policy показывает ваш выбор, actual_boot_policy — фактический UnitFileState. Во время обслуживания запуск при загрузке временно отключён; восстановление политики выполняется только явным resume. Unknown не означает disabled.</p></section>", escape(&serde_json::to_string_pretty(&crate::minecraft_autostart::status(&config))?)));
     for (section, fields) in config.as_object().context("Config invalid")? {
         html.push_str(&format!("<fieldset><legend>{}</legend>", escape(section)));
         for (key, value) in fields.as_object().context("Section invalid")? {
@@ -67,6 +68,11 @@ pub fn page(path: &Path, csrf: &str) -> Result<String> {
             "agent-activate",
             "Подтвердить и включить автоматическую проверку Git",
             "<p>Только проверенный установленный gitcraft-agent.service. При отказе автоматизация не считается включённой; initialization повторять не нужно.</p>",
+        ),
+        (
+            "minecraft-autostart",
+            "Подтвердить политику Minecraft при загрузке машины",
+            "<select name=policy required><option value=''>Выберите явно</option><option value=enabled>Включить запуск Minecraft при загрузке</option><option value=disabled>Оставлять Minecraft остановленным при загрузке</option></select><p>Не запускает Minecraft сейчас. Обслуживание сохраняет приоритет до явного resume.</p>",
         ),
         (
             "bootstrap",
@@ -185,6 +191,11 @@ pub fn run_operation(config: &Value, name: &str, form: &HashMap<String, String>)
                 json!({"status":"activation_required","message":error.to_string(),"observed":crate::agent_service::status(),"next_action":"agent-activate"})
             }
         }),
+        "minecraft-autostart" => crate::minecraft_autostart::set(
+            config,
+            form.get("policy").context("Select boot policy")?,
+            true,
+        ),
         "bootstrap" => {
             ensure!(
                 form.get("accept_eula").is_some_and(|v| v == "yes"),
@@ -231,6 +242,7 @@ pub fn validate_operation(name: &str, form: &HashMap<String, String>) -> Result<
         [
             "bootstrap",
             "agent-activate",
+            "minecraft-autostart",
             "stop",
             "resume",
             "recover",
@@ -248,6 +260,13 @@ pub fn validate_operation(name: &str, form: &HashMap<String, String>) -> Result<
         ensure!(
             form.get("accept_eula").is_some_and(|value| value == "yes"),
             "Explicit EULA acceptance required"
+        );
+    }
+    if name == "minecraft-autostart" {
+        ensure!(
+            form.get("policy")
+                .is_some_and(|v| ["enabled", "disabled"].contains(&v.as_str())),
+            "Explicit enabled/disabled boot policy required"
         );
     }
     if name == "resume" {
@@ -281,6 +300,8 @@ pub fn outcome(config: &Value, result: Result<Value>) -> (String, Value) {
                 "activation_required"
             } else if value["status"] == "recovery_required" {
                 "recovery_required"
+            } else if value["boot_policy_required"] == true {
+                "setup_required"
             } else {
                 "completed"
             };
@@ -366,6 +387,45 @@ mod activation_ui_tests {
             ),
         );
         assert_eq!(status, "completed");
+    }
+
+    #[test]
+    fn minecraft_boot_policy_requires_explicit_validated_choice() {
+        let (status, _) = outcome(
+            &json!({}),
+            Ok(json!({"status":"adopted","boot_policy_required":true})),
+        );
+        assert_eq!(status, "setup_required");
+        let (status, _) = outcome(
+            &json!({}),
+            Ok(json!({"status":"partial_success","boot_policy_required":true})),
+        );
+        assert_eq!(status, "activation_required");
+        assert!(validate_operation("minecraft-autostart", &HashMap::new()).is_err());
+        for policy in ["", "masked", "--now", "enabled minecraft.service"] {
+            assert!(
+                validate_operation(
+                    "minecraft-autostart",
+                    &HashMap::from([
+                        ("confirmed".into(), "yes".into()),
+                        ("policy".into(), policy.into())
+                    ])
+                )
+                .is_err()
+            );
+        }
+        for policy in ["enabled", "disabled"] {
+            assert!(
+                validate_operation(
+                    "minecraft-autostart",
+                    &HashMap::from([
+                        ("confirmed".into(), "yes".into()),
+                        ("policy".into(), policy.into())
+                    ])
+                )
+                .is_ok()
+            );
+        }
     }
 
     #[test]

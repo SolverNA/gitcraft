@@ -32,3 +32,5 @@ pub mod agent_service;
 
 #[cfg(test)]
 mod activation_acceptance;
+
+pub mod minecraft_autostart;

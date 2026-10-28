@@ -18,8 +18,7 @@ use std::{
 use tiny_http::{Header, Request, Response, Server};
 
 pub fn status(value: &Value) -> Value {
-    let mut result =
-        json!({"service":value["deployment"]["service"],"poller":crate::agent_service::status()});
+    let mut result = json!({"service":value["deployment"]["service"],"poller":crate::agent_service::status(),"minecraft_autostart":crate::minecraft_autostart::status(value)});
     if let Some(state) = value["paths"]["state"].as_str() {
         for name in ["status", "deployment", "ui-operation"] {
             if let Ok(text) = fs::read_to_string(Path::new(state).join(format!("{name}.json")))
