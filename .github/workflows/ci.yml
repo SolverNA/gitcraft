@@ -14,3 +14,7 @@ jobs:
       - run: cargo test --locked
       - run: bash scripts/test-install.sh
       - run: node scripts/test-transfer-ui.cjs
+      - run: npm ci --ignore-scripts
+      - run: npx playwright install --with-deps chromium
+      - run: cargo build --locked
+      - run: npm run test:browser

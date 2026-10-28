@@ -1,0 +1,32 @@
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const net = require('node:net');
+const {spawn, execFileSync} = require('node:child_process');
+function git(cwd, args) { return execFileSync('git', ['-C', cwd, '-c', 'core.hooksPath=/dev/null', '-c', 'commit.gpgsign=false', ...args], {encoding: 'utf8', stdio: ['ignore','pipe','pipe']}).trim(); }
+async function port() {const server = net.createServer(); await new Promise(r => server.listen(0, '127.0.0.1', r)); const p=server.address().port; await new Promise(r=>server.close(r)); return p;}
+function packet(id, kind, text) {const bytes=Buffer.from(text); const out=Buffer.alloc(bytes.length+14);out.writeInt32LE(bytes.length+10,0);out.writeInt32LE(id,4);out.writeInt32LE(kind,8);bytes.copy(out,12);return out;}
+async function fixture() {
+  const root=fs.mkdtempSync(path.join(os.tmpdir(),'gitcraft-real-browser-'));
+  const paths=Object.fromEntries(['repository','server','state','cache','staging','backups'].map(k=>{const p=path.join(root,k);fs.mkdirSync(p);return[k,p];}));
+  const tools=path.join(root,'tools');fs.mkdirSync(tools);const runtime=path.join(root,'runtime');fs.writeFileSync(runtime,'inactive');
+  const sudo=path.join(tools,'sudo');fs.writeFileSync(sudo,`#!/bin/sh\nprintf '%s\\n' "$*" >> '${root}/service-calls'\ncase "$3" in\nis-active) state=$(cat '${runtime}');printf '%s\\n' "$state";[ "$state" = active ] && exit 0;exit 3;;\nstop) printf inactive > '${runtime}';exit 0;;\nstart) printf active > '${runtime}';exit 0;;\n*) exit 90;;\nesac\n`,{mode:0o755});
+  const authoring=path.join(root,'authoring');fs.mkdirSync(authoring);git(authoring,['init','--initial-branch=main']);git(authoring,['config','user.name','Browser fixture']);git(authoring,['config','user.email','browser@example.invalid']);
+  fs.mkdirSync(path.join(authoring,'server-settings'));fs.writeFileSync(path.join(authoring,'server-settings/server.properties'),'motd=before\nonline-mode=true\n');fs.mkdirSync(path.join(authoring,'requirements'));fs.writeFileSync(path.join(authoring,'requirements/engine.json'),JSON.stringify({name:'Fixture engine',filename:'server.jar',pinned:{transfer:true,version:'fixture',sha256:'a'.repeat(64)},source:{provider:'transfer'}}));git(authoring,['add','server-settings/server.properties','requirements/engine.json']);git(authoring,['commit','-m','initial fixture']);
+  const approved=git(authoring,['rev-parse','HEAD']);const remote=path.join(root,'remote.git');execFileSync('git',['init','--bare',remote],{stdio:'ignore'});git(authoring,['remote','add','origin','git@github.com:fixture/config.git']);git(authoring,['config',`url.file://${remote}.insteadOf`,'git@github.com:fixture/config.git']);git(authoring,['push','origin','main']);
+  const ghstate=path.join(root,'gh-state.json');fs.writeFileSync(ghstate,JSON.stringify({failOnce:true,attempts:0}));
+  fs.writeFileSync(path.join(tools,'gh'),`#!/usr/bin/env node
+const fs=require('node:fs'),{execFileSync}=require('node:child_process');const args=process.argv.slice(2);const file=${JSON.stringify(ghstate)};let s=JSON.parse(fs.readFileSync(file));fs.appendFileSync(${JSON.stringify(path.join(root,'gh-calls'))},args.join(' ')+'\\n');
+if(args[0]==='auth')process.exit(0);
+if(args[0]==='pr'&&args[1]==='list'){console.log(JSON.stringify(s.pr?[s.pr]:[]));process.exit(0);}
+if(args[0]==='pr'&&args[1]==='create'){s.attempts++;if(s.failOnce&&s.attempts===1){fs.writeFileSync(file,JSON.stringify(s));process.exit(1);}const flag=n=>args[args.indexOf(n)+1];s.pr={url:'https://github.com/fixture/config/pull/7',state:'OPEN',baseRefName:flag('--base'),headRefOid:execFileSync('git',['rev-parse',flag('--head')],{encoding:'utf8'}).trim()};fs.writeFileSync(file,JSON.stringify(s));console.log(s.pr.url);process.exit(0);}process.exit(90);
+`,{mode:0o755});
+  const rcon=net.createServer(socket=>{let buffer=Buffer.alloc(0);socket.on('error',()=>{});socket.on('data',chunk=>{buffer=Buffer.concat([buffer,chunk]);while(buffer.length>=4){const n=buffer.readInt32LE(0);if(n<10||n>1024*1024){socket.destroy();return;}if(buffer.length<n+4)return;const b=buffer.subarray(4,n+4);buffer=buffer.subarray(n+4);const id=b.readInt32LE(0),kind=b.readInt32LE(4),text=b.subarray(8,b.length-2).toString();if(kind===3)socket.write(packet(id,2,''));else socket.write(packet(id,0,text==='minecraft:list'?'There are 0 of a max of 20 players online:':'Saved'));}});});
+  await new Promise(r=>rcon.listen(0,'127.0.0.1',r));const webPort=await port();const config={repository:{url:'git@github.com:fixture/config.git',branch:'main',authoring_path:authoring,poll_interval_seconds:60},paths,deployment:{service:'gitcraft-browser-fixture.service',empty_grace_seconds:0,health_timeout_seconds:3},rcon:{host:'127.0.0.1',port:rcon.address().port,password_env:'MINECRAFT_RCON_PASSWORD',timeout_seconds:1},web:{host:'127.0.0.1',port:webPort,token_env:'GITCRAFT_WEB_TOKEN'},transfer:{max_session_bytes:134217728,max_staging_bytes:268435456,max_files:1000,min_free_bytes:1,session_ttl_seconds:604800}};
+  const configPath=path.join(root,'agent.yml');fs.writeFileSync(configPath,JSON.stringify(config));const token='real-browser-login-token-at-least-24';const rconSecret='real-browser-rcon-secret';
+  const child=spawn(process.env.GITCRAFT_BROWSER_BINARY||path.resolve('target/debug/gitcraft'),['web','--config',configPath],{env:{...process.env,PATH:`${tools}:${process.env.PATH}`,GITCRAFT_WEB_TOKEN:token,MINECRAFT_RCON_PASSWORD:rconSecret,GIT_CONFIG_COUNT:'1',GIT_CONFIG_KEY_0:`url.file://${remote}.insteadOf`,GIT_CONFIG_VALUE_0:'git@github.com:fixture/config.git'},stdio:['ignore','pipe','pipe']});let stderr='';child.stderr.on('data',b=>{stderr+=b;});
+  const endpoint=`http://127.0.0.1:${webPort}`;const deadline=Date.now()+10000;while(true){try{await fetch(endpoint);break;}catch{if(Date.now()>deadline||child.exitCode!==null)throw new Error(`fixture web failed: ${stderr}`);await new Promise(r=>setTimeout(r,20));}}
+  return{root,paths,authoring,remote,approved,ghstate,config,configPath,token,rconSecret,runtime,endpoint,git,async close(){child.kill();await new Promise(r=>child.exitCode!==null?r():child.once('exit',r));await new Promise(r=>rcon.close(r));fs.rmSync(root,{recursive:true,force:true});}};
+}
+async function login(page,f,token=f.token){await page.goto(f.endpoint);await page.locator('input[name=token]').fill(token);await page.locator('form[action="/login"] button').click();await page.getByRole('link',{name:'Открыть панель'}).click();}
+module.exports={fixture,login};

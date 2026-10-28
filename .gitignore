@@ -10,3 +10,6 @@ secrets.env
 
 /target/
 .idea/
+/node_modules/
+/test-results/
+/playwright-report/
